@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memory-gate"
+version = "0.1.0"
+description = "A fail-closed human gate in front of LLM context compaction for LangChain agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = [
+    "langchain",
+    "langgraph",
+    "middleware",
+    "context",
+    "compaction",
+    "summarization",
+    "memory",
+    "human-in-the-loop",
+    "agent",
+]
+authors = [
+    { name = "2xIarge", email = "327557792+2xIarge@users.noreply.github.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "langchain>=1.0,<2",
+    "langgraph>=1.0,<2",
+    "typing-extensions>=4.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/2xIarge/memory-gate"
+Repository = "https://github.com/2xIarge/memory-gate"
+Issues = "https://github.com/2xIarge/memory-gate/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memory_gate"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 95
+src = ["src"]

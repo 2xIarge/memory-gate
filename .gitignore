@@ -1,0 +1,21 @@
+# archives written by the library and the demos
+.memory-gate/
+archive.jsonl
+keep.jsonl
+runs.jsonl
+
+# local verification scratch
+scripts/verify_report.txt
+probe_report.txt
+pytest_output.txt
+demo_output.txt
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

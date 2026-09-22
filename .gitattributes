@@ -1,0 +1,11 @@
+# Normalise line endings so the repo is byte-identical on Windows and POSIX.
+# Without this, git on Windows rewrites every LF file to CRLF on checkout.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+
+# Never let a real conversation archive sneak into a commit.
+.memory-gate/ export-ignore
+.scratch/ export-ignore
