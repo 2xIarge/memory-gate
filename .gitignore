@@ -1,3 +1,7 @@
+# everything this repo writes at runtime, and every local scratch artefact,
+# lives here -- never in the working tree root
+.scratch/
+
 # archives written by the library and the demos
 .memory-gate/
 archive.jsonl
