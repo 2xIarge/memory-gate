@@ -46,11 +46,25 @@ class ReviewItem(TypedDict):
     """LangChain message id -- the handle used for pinning and later restore."""
 
     role: str
-    turn: int
+    pass_no: int
     tokens: int
+    flagged: bool
+    """True when this item matched a protect pattern, i.e. it looks like a
+    durable constraint rather than chatter.
+
+    The reviewer still decides. This only says *why* the item is on the list, so
+    a human can confirm a shortlist instead of rereading the transcript -- and so
+    a host can adopt a "pin the flagged ones" policy without writing its own
+    classifier.
+    """
     preview: str
     """Truncated verbatim text. Verbatim, not paraphrased: a paraphrase can
     omit an item, and an omitted item is one the user never got to save."""
+
+
+def flagged_refs(request: "MemoryReviewRequest") -> list[int]:
+    """Refs worth pinning under the "only keep constraints" policy."""
+    return [i["ref"] for i in request["items"] if i.get("flagged")]
 
 
 class MemoryReviewRequest(TypedDict):
@@ -172,6 +186,7 @@ def parse_reply(reply: Any, valid_refs: set[int]) -> MemoryReviewResponse:
 
 def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72) -> str:
     """Render a request as a plain-chat review block. No LLM involved."""
+    flagged = [i for i in req["items"] if i.get("flagged")]
     lines = [
         f"About to compact {req['dropped_total']} messages "
         f"({req['dropped_tokens']} tokens of dialogue).",
@@ -183,15 +198,21 @@ def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72) -> 
         preview = item["preview"].replace("\n", " ")
         if len(preview) > preview_width:
             preview = preview[: preview_width - 1] + "\u2026"
+        mark = "*" if item.get("flagged") else " "
         lines.append(
-            f" [{item['ref']:>2}] #{item['id']:<10} {item['tokens']:>5} tok  "
+            f" [{item['ref']:>2}]{mark} #{item['id']:<10} {item['tokens']:>5} tok  "
             f"{item['role']:<9} {preview}"
         )
+    if flagged:
+        refs = ",".join(str(i["ref"]) for i in flagged)
+        lines.append("")
+        lines.append(" * matched a protect pattern -- looks like a standing constraint,")
+        lines.append(f"   not chatter. Those refs: {refs}")
     if req.get("omitted"):
         lines.append("")
         lines.append(
-            f" {req['omitted']} more messages (tool results, non-dialogue) are also"
-            " being dropped and are not listed here."
+            f" {req['omitted']} more messages are also being dropped but are not"
+            " listed (tool results, and assistant replies unless pin_roles is widened)."
         )
     lines += [
         "",

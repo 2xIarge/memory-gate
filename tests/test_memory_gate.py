@@ -101,7 +101,7 @@ def drive(agent, thread: str, msgs):  # noqa: ANN001
 
 def test_archive_is_idempotent(workdir: Path) -> None:
     archive = Archive(workdir)
-    records = [Record(id=f"m{i}", role="human", turn=i, ts="t", tokens=5, text=f"x{i}")
+    records = [Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=5, text=f"x{i}")
                for i in range(4)]
     assert archive.append(records) == 4
     assert archive.append(records) == 0
@@ -113,12 +113,12 @@ def test_archive_raises_when_unwritable(workdir: Path) -> None:
     blocker.write_text("not a directory", encoding="utf-8")
     archive = Archive(blocker / "nested")
     with pytest.raises(ArchiveWriteError):
-        archive.append([Record(id="a", role="human", turn=1, ts="t", tokens=1, text="x")])
+        archive.append([Record(id="a", role="human", pass_no=1, ts="t", tokens=1, text="x")])
 
 
 def test_protect_and_restore_roundtrip(workdir: Path) -> None:
     archive = Archive(workdir)
-    archive.append([Record(id="a", role="human", turn=1, ts="t", tokens=3,
+    archive.append([Record(id="a", role="human", pass_no=1, ts="t", tokens=3,
                            text="fx rate rule", kind="dialogue")])
     gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 2))
     assert gate.restore("a").text == "fx rate rule"
@@ -299,27 +299,137 @@ def test_every_gate_run_is_recorded(workdir: Path) -> None:
 # -------------------------------------------------------------- guardrails
 
 
+def test_assistant_restatements_are_not_pinned_by_default(workdir: Path) -> None:
+    """The assistant echoing a rule back is redundant with the user's own wording
+    and competes for the same protect budget. Measured: roughly half the pinned
+    tokens were restatements, halving how many distinct constraints fit."""
+    from langchain_core.messages import HumanMessage
+    from langgraph.types import Command
+
+    def run_and_keep_all(gate, thread, turns):
+        agent = create_agent(model=fake_model("这条也必须遵守。"), tools=[],
+                             middleware=[gate, make_summarizer()],
+                             checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": thread}}
+        for text in turns:
+            res = agent.invoke({"messages": [HumanMessage(content=text)]}, config=config)
+            while "__interrupt__" in res:
+                res = agent.invoke(Command(resume="keep all"), config=config)
+
+    turns = ["报表必须用 net_revenue。", "图表必须加季度号。", "金额必须是美元。"] * 6
+
+    # keep_messages must match make_summarizer()'s keep, or the gate computes an
+    # empty window and never reviews -- exactly the mis-binding the constructor
+    # now warns about.
+    narrow = MemoryGateMiddleware(archive_dir=workdir / "narrow",
+                                  trigger=("messages", 10), keep_messages=4,
+                                  review_threshold_tokens=0,
+                                  protect_patterns=(r"必须",))
+    run_and_keep_all(narrow, "pinroles-narrow", turns)
+    pinned = narrow.archive.protected()
+    assert pinned, "the user's own constraints should be pinned"
+    assert all(r.role == "human" for r in pinned), "assistant reply leaked into pins"
+
+    wide = MemoryGateMiddleware(archive_dir=workdir / "wide",
+                                trigger=("messages", 10), keep_messages=4,
+                                review_threshold_tokens=0,
+                                protect_patterns=(r"必须",), pin_roles=("human", "ai"))
+    run_and_keep_all(wide, "pinroles-wide", turns)
+    wide_pinned = wide.archive.protected()
+    assert any(r.role == "ai" for r in wide_pinned), "widening pin_roles did nothing"
+    # the whole point: fewer, denser pins for the same conversation
+    assert len(pinned) < len(wide_pinned)
+
+
+def test_empty_pin_roles_is_refused(workdir: Path) -> None:
+    with pytest.raises(ValueError, match="pin_roles"):
+        MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 500), pin_roles=())
+
+
+def test_protect_budget_bounds_the_injection(workdir: Path) -> None:
+    """Regression: the pinned text is injected on *every* model call, so an
+    uncapped protected set raises reported token usage, trips the compaction
+    trigger sooner, causes more reviews, which pin more. Measured at 2 -> 31
+    compaction cycles. The budget stops the growth and the overflow is declared.
+    """
+    archive = Archive(workdir)
+    for i in range(10):
+        rec = Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=200,
+                     text=f"constraint number {i}", kind="dialogue")
+        archive.append([rec])
+        archive.protect([rec])
+
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 500),
+                                protect_budget_tokens=500)
+    kept, omitted = gate.protected_view()
+    assert sum(r.tokens for r in kept) <= 500
+    assert {r.id for r in kept} == {"m8", "m9"}, "newest pins must win"
+    assert [r.id for r in kept] == ["m8", "m9"], "injection must read chronologically"
+    assert len(omitted) == 8
+
+
+def test_absurd_budget_is_refused(workdir: Path) -> None:
+    """A budget too small to hold anything would leave the gate looking armed
+    while injecting nothing -- the silent no-op class of langchain#39247."""
+    with pytest.raises(ValueError, match="protect_budget_tokens"):
+        MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 500),
+                             protect_budget_tokens=10)
+
+
 def test_constructing_without_a_trigger_is_refused(workdir: Path) -> None:
     with pytest.raises(ValueError, match="silently useless"):
         MemoryGateMiddleware(archive_dir=workdir)
 
 
+def msgs(n: int, reported: int | None = None) -> list:
+    """A message list of length n; last AIMessage carries `reported` total tokens."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    out = [HumanMessage(content=f"h{i}") for i in range(max(0, n - 1))]
+    ai = AIMessage(content="a")
+    if reported is not None:
+        ai.usage_metadata = {"input_tokens": reported, "output_tokens": 0,
+                             "total_tokens": reported}
+    out.append(ai)
+    return out
+
+
 @pytest.mark.parametrize(
-    ("trigger", "n_messages", "tokens", "imminent"),
+    ("trigger", "n_messages", "tokens", "reported", "imminent"),
     [
-        (("messages", 10), 10, 0, True),
-        (("messages", 10), 9, 0, False),
-        (("tokens", 100), 3, 99, False),
-        (("tokens", 100), 3, 100, True),
-        ({"tokens": 100, "messages": 5}, 5, 99, False),
-        ({"tokens": 100, "messages": 5}, 5, 100, True),
-        ([{"tokens": 100, "messages": 5}, ("messages", 50)], 50, 0, True),
+        (("messages", 10), 10, 0, None, True),
+        (("messages", 10), 9, 0, None, False),
+        (("tokens", 100), 3, 99, None, False),
+        (("tokens", 100), 3, 100, None, True),
+        ({"tokens": 100, "messages": 5}, 5, 99, None, False),
+        ({"tokens": 100, "messages": 5}, 5, 100, None, True),
+        ([{"tokens": 100, "messages": 5}, ("messages", 50)], 50, 0, None, True),
+        # the summariser fires on approximate OR model-reported tokens; the gate
+        # has to match both halves or it reviews too late and loses content
+        (("tokens", 500), 6, 120, 900, True),
+        (("tokens", 500), 6, 120, 100, False),
     ],
 )
 def test_trigger_semantics_match_the_library(workdir: Path, trigger, n_messages, tokens,
-                                             imminent) -> None:
+                                             reported, imminent) -> None:
     gate = MemoryGateMiddleware(archive_dir=workdir, trigger=trigger)
-    assert gate._compaction_is_imminent(n_messages, tokens) is imminent
+    assert gate._compaction_is_imminent(msgs(n_messages, reported), tokens) is imminent
+
+
+def test_records_number_passes_not_stale_list_indices(workdir: Path) -> None:
+    """`turn` used to be the index in the live list, which stops meaning anything
+    once compaction pins that list near the keep window."""
+    summarizer = make_summarizer()
+    gate = MemoryGateMiddleware(archive_dir=workdir, summarization=summarizer,
+                                review_threshold_tokens=0, protect_patterns=(r"zzz",))
+    agent = create_agent(model=fake_model("ok"), tools=[],
+                         middleware=[gate, summarizer], checkpointer=InMemorySaver())
+    drive(agent, "passno", history())
+    passes = {r.pass_no for r in gate.archive._read(gate.archive.archive_path)}
+    assert passes and min(passes) >= 1
+    assert len(passes) > 1, "pass counter never advanced; it is a constant again"
+    assert not hasattr(gate.archive._read(gate.archive.archive_path)[0], "turn")
+
 
 
 def test_compaction_summaries_are_never_offered_for_review(workdir: Path) -> None:

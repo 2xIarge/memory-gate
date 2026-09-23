@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import uuid
+import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -174,7 +175,9 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         keep_messages: int | None = None,
         review_threshold_tokens: int = 400,
         protect_patterns: Sequence[str] | None = None,
+        pin_roles: Sequence[str] = ("human",),
         preview_chars: int = 120,
+        protect_budget_tokens: int = 1200,
         inject: bool = True,
         enabled: bool = True,
         token_counter: Callable[[Sequence[Any]], int] | None = None,
@@ -193,7 +196,17 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             review_threshold_tokens: Pause and ask once this many dialogue tokens
                 are about to leave the window, even if no pattern matched.
             protect_patterns: Regexes marking a likely durable constraint.
+            pin_roles: Roles whose messages may be offered for pinning. Defaults
+                to human only: constraints are stated by the user, and the
+                assistant's restatement of the same rule is redundant text that
+                competes for the same protect budget it is meant to protect.
+                Widen it if you want replies pinned too.
             preview_chars: Verbatim preview length per review item.
+            protect_budget_tokens: Hard ceiling on pinned text injected into every
+                model call. Without one the injection raises the reported token count,
+                which trips the compaction trigger, which causes another review, which
+                pins more -- a runaway. Measured: 2 compaction cycles became 31.
+                Overflow is omitted and declared, never silently dropped.
             inject: Re-inject pinned items on every model call.
             enabled: Kill switch; a disabled gate archives and injects nothing.
             token_counter: Override the estimator.
@@ -220,10 +233,23 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             )
         if preview_chars <= 0:
             raise ValueError("memory-gate: preview_chars must be > 0.")
+        self.pin_roles = tuple(pin_roles)
+        if not self.pin_roles:
+            raise ValueError(
+                "memory-gate: pin_roles is empty, so nothing could ever be offered "
+                "for pinning -- a review gate with no candidates never fires."
+            )
+        if protect_budget_tokens < 100:
+            raise ValueError(
+                "memory-gate: protect_budget_tokens must be >= 100; a tiny budget "
+                "injects nothing while still looking armed -- the silent no-op "
+                "langchain#39247 exists to prevent."
+            )
 
         self.archive = Archive(archive_dir)
         self.review_threshold_tokens = review_threshold_tokens
         self.preview_chars = preview_chars
+        self.protect_budget_tokens = protect_budget_tokens
         self.inject = inject
         self.enabled = enabled
         self._summarization = summarization
@@ -232,6 +258,18 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         )
         self._fraction_limit = self._resolve_fraction_limit(summarization)
         self._keep_messages = self._resolve_keep_messages(summarization, keep_messages)
+        if summarization is None and keep_messages is None:
+            # Observed in the wild: a gate configured with only a trigger silently
+            # assumed keep=20 while the middleware it guarded kept 4. The computed
+            # window was then always empty, so it never reviewed anything and never
+            # said so.
+            warnings.warn(
+                "memory-gate: no `summarization` object was passed, so keep_messages "
+                f"defaults to {self._keep_messages}. If the middleware you guard keeps "
+                "a different number, this gate mis-times its reviews and may never "
+                "fire at all -- pass summarization=<instance> or keep_messages=<n>.",
+                stacklevel=2,
+            )
         self._patterns = [
             re.compile(p, re.IGNORECASE)
             for p in (protect_patterns if protect_patterns is not None else DEFAULT_PROTECT_PATTERNS)
@@ -295,33 +333,66 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
     def _is_risky(self, text: str) -> bool:
         return any(p.search(text) for p in self._patterns)
 
-    def _clause_met(self, clause: dict[str, float], n_messages: int, total_tokens: int) -> bool:
+    @staticmethod
+    def _reported_tokens(messages: Sequence[AnyMessage]) -> int:
+        """``usage_metadata.total_tokens`` of the newest AIMessage, else -1.
+
+        ``SummarizationMiddleware._should_summarize`` fires a ``tokens`` clause
+        when the approximate count crosses the threshold **or** the model's own
+        reported total does. Ignoring that second half -- as this file originally
+        did -- makes the gate believe compaction happens later than it does, and
+        content then leaves the window without ever being reviewed. Observed with
+        a real model: a constraint stated on turn 0 was compacted away unasked.
+        """
+        for message in reversed(list(messages)):
+            if isinstance(message, AIMessage):
+                usage = getattr(message, "usage_metadata", None)
+                if not usage:
+                    return -1
+                try:
+                    return int(usage.get("total_tokens", -1))
+                except (TypeError, ValueError, AttributeError):
+                    return -1
+        return -1
+
+    def _clause_met(self, clause: dict[str, float], n_messages: int, total_tokens: int,
+                    reported_tokens: int) -> bool:
         if not clause:
             return False
         for key, value in clause.items():
             if key == "messages":
                 if n_messages < value:
                     return False
-            elif key in ("tokens",):
-                if total_tokens < value:
+            elif key == "tokens":
+                if total_tokens < value and reported_tokens < value:
                     return False
             elif key == "fraction":
                 if self._fraction_limit is None:
                     continue  # cannot evaluate conservatively; treat as met
-                if total_tokens < value * self._fraction_limit:
+                threshold = value * self._fraction_limit
+                if total_tokens < threshold and reported_tokens < threshold:
                     return False
             # unknown key: ignored, i.e. treated as met (asks rather than skips)
         return True
 
-    def _compaction_is_imminent(self, n_messages: int, total_tokens: int) -> bool:
+    def _compaction_is_imminent(self, messages: Sequence[AnyMessage],
+                                total_tokens: int) -> bool:
         """Would the guarded middleware actually compact on this turn?
 
-        Without this check the gate asks about deletions that are not happening
-        yet, so the reviewer is interrupted on almost every turn and the same
-        unpinned items come back each time. That is the fastest route to
-        "make it stop" and thus to the gate being uninstalled.
+        Without this the gate asks about deletions that are not happening yet,
+        so the reviewer is interrupted nearly every turn -- the fastest route to
+        "make it stop" and to the gate being uninstalled.
+
+        The library additionally requires a model-provider match before it trusts
+        reported tokens. We deliberately do not check it: a false alarm costs one
+        extra prompt (and identical candidate sets are never re-asked anyway),
+        while a missed review is silent, unrecoverable loss. Raise
+        ``review_threshold_tokens`` if a host sees too many alarms.
         """
-        return any(self._clause_met(c, n_messages, total_tokens) for c in self._trigger)
+        n_messages = len(messages)
+        reported = self._reported_tokens(messages)
+        return any(self._clause_met(c, n_messages, total_tokens, reported)
+                   for c in self._trigger)
 
     def _ensure_ids(self, messages: list[AnyMessage]) -> None:
         """Mirror ``SummarizationMiddleware._ensure_message_ids``.
@@ -333,13 +404,13 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             if getattr(message, "id", None) is None:
                 message.id = str(uuid.uuid4())
 
-    def _to_record(self, message: AnyMessage, turn: int) -> Record:
+    def _to_record(self, message: AnyMessage, pass_no: int) -> Record:
         text = _text_of(message)
         role = getattr(message, "type", None) or message.__class__.__name__.lower()
         return Record(
             id=str(message.id),
             role=str(role),
-            turn=turn,
+            pass_no=pass_no,
             ts=utcnow(),
             tokens=int(self._token_counter([message])),
             text=text,
@@ -356,37 +427,51 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             return None
 
         self._ensure_ids(messages)
+
+        # ``turn`` used to be the message's index in the current list. Once the
+        # first compaction lands, that list stays pinned near the keep window, so
+        # the number stopped being a turn at all -- it read 4, 5, 6 forever. A
+        # counter carried in private state is monotone and names what it counts.
+        carried = state.get("memory_gate") if isinstance(state, dict) else None
+        pass_no = (int(carried.get("pass_no", 0)) + 1) if isinstance(carried, dict) else 1
+
+        def outcome(extra: dict[str, Any]) -> dict[str, Any]:
+            return {"memory_gate": {"pass_no": pass_no, **extra}}
+
         keep_n = self._keep_messages
         if len(messages) <= keep_n:
             self.archive.mark_run(
                 {"reviewed": False, "reason": "within_keep_window", "messages": len(messages)}
             )
-            return None
+            return outcome({"reviewed": False, "reason": "within_keep_window"})
 
         zone = messages[: len(messages) - keep_n]
-        base = len(messages) - len(zone)
-        records = [self._to_record(m, base + i) for i, m in enumerate(zone)]
+        records = [self._to_record(m, pass_no) for m in zone]
 
         # Unconditional, idempotent, and before anything can be deleted.
         written = self.archive.append(records)
 
         total_tokens = int(self._token_counter(messages))
-        if not self._compaction_is_imminent(len(messages), total_tokens):
+        if not self._compaction_is_imminent(messages, total_tokens):
             self.archive.mark_run(
                 {"reviewed": False, "reason": "compaction_not_imminent",
                  "archived": written, "zone": len(zone), "messages": len(messages),
-                 "total_tokens": total_tokens}
+                 "total_tokens": total_tokens,
+                 "reported_tokens": self._reported_tokens(messages)}
             )
-            return None
+            return outcome({"reviewed": False, "reason": "compaction_not_imminent"})
 
         protected_ids = self.archive.protected_ids()
-        candidates = [r for r in records if r.is_dialogue and r.id not in protected_ids]
+        candidates = [
+            r for r in records
+            if r.is_dialogue and r.role in self.pin_roles and r.id not in protected_ids
+        ]
         if not candidates:
             self.archive.mark_run(
                 {"reviewed": False, "reason": "no_unprotected_dialogue",
                  "archived": written, "zone": len(zone)}
             )
-            return None
+            return outcome({"reviewed": False, "reason": "no_unprotected_dialogue"})
 
         risky = [r for r in candidates if self._is_risky(r.text)]
         dialogue_tokens = sum(r.tokens for r in candidates)
@@ -396,26 +481,26 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 {"reviewed": False, "reason": "below_threshold", "archived": written,
                  "zone": len(zone), "dialogue_tokens": dialogue_tokens}
             )
-            return None
+            return outcome({"reviewed": False, "reason": "below_threshold"})
 
         items: list[ReviewItem] = [
             ReviewItem(
                 ref=i + 1,
                 id=r.id,
                 role=r.role,
-                turn=r.turn,
+                pass_no=r.pass_no,
                 tokens=r.tokens,
+                flagged=self._is_risky(r.text),
                 preview=r.text[: self.preview_chars],
             )
             for i, r in enumerate(candidates)
         ]
         review_id = build_review_id(items)
 
-        previous = state.get("memory_gate") if isinstance(state, dict) else None
         if (
-            isinstance(previous, dict)
-            and previous.get("reviewed")
-            and previous.get("review_id") == review_id
+            isinstance(carried, dict)
+            and carried.get("reviewed")
+            and carried.get("review_id") == review_id
         ):
             # The reviewer already answered for exactly this candidate set. Asking
             # again would be pure nagging; the pinning decision is persisted on
@@ -424,7 +509,8 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 {"reviewed": False, "reason": "already_reviewed", "review_id": review_id,
                  "archived": written, "zone": len(zone)}
             )
-            return None
+            return outcome({"reviewed": False, "reason": "already_reviewed",
+                            "review_id": review_id})
 
         request: MemoryReviewRequest = {
             "review_id": review_id,
@@ -464,6 +550,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         pinned = self.archive.protect(chosen)
 
         run = {
+            "pass_no": pass_no,
             "reviewed": True,
             "review_id": request["review_id"],
             "reason": request["reason"],
@@ -488,22 +575,51 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         ]
         for r in records:
             body = r.text.strip().replace("\n", " ")
-            lines.append(f"- [{r.role} #{r.id} turn {r.turn}] {body}")
+            lines.append(f"- [{r.role} #{r.id}] {body}")
         lines.append("</memory_gate>")
         return "\n".join(lines)
+
+    def protected_view(self) -> tuple[list[Record], list[Record]]:
+        """Split the pinned set into (injected, omitted) under the budget.
+
+        Newest first: a constraint stated 300 turns ago is likelier stale than one
+        stated 3 turns ago. Nothing is deleted -- overflow stays pinned on disk and
+        the omission is declared inside the block, so the model can say "I no longer
+        have X in context" instead of quietly guessing at it.
+        """
+        records = self.archive.protected()
+        kept: list[Record] = []
+        used = 0
+        for record in reversed(records):
+            if used + record.tokens > self.protect_budget_tokens:
+                break
+            kept.append(record)
+            used += record.tokens
+        kept.reverse()
+        included = {r.id for r in kept}
+        return kept, [r for r in records if r.id not in included]
 
     def _apply_injection(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
         if not (self.enabled and self.inject):
             return request
-        records = self.archive.protected()
-        if not records:
+        kept, omitted = self.protected_view()
+        if not kept and not omitted:
             return request
         present = {str(getattr(m, "id", "")) for m in request.messages}
-        missing = [r for r in records if r.id not in present]
-        if not missing:
+        kept = [r for r in kept if r.id not in present]
+        omitted = [r for r in omitted if r.id not in present]
+        if not kept and not omitted:
             return request  # still verbatim in the window; no need to duplicate
 
-        block = self._injection_block(missing)
+        block = self._injection_block(kept)
+        if omitted:
+            block = block.replace(
+                "</memory_gate>",
+                f" {len(omitted)} further pinned statements are NOT in this context "
+                "(the protect budget is full); they remain on disk and can be "
+                "retrieved. Say so rather than guessing at them."
+                + "\n</memory_gate>",
+            )
         existing = getattr(request, "system_message", None)
         base = _text_of(existing) if existing is not None else ""
         merged = f"{base}\n\n{block}".strip() if base.strip() else block

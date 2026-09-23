@@ -175,7 +175,7 @@ def main() -> int:
         print("\npost-hoc recovery is available even for items you did not pin:")
         hits = gate.search("April")
         for record in hits[:3]:
-            print(f"  #{record.id[:12]}  turn {record.turn:>2}  {record.text[:60]}")
+            print(f"  #{record.id[:12]}  pass {record.pass_no:>2}  {record.text[:60]}")
         return 0 if (restored_by_gate and lost) else 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

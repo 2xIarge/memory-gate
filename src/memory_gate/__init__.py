@@ -8,6 +8,7 @@ from .review import (
     MemoryReviewRequest,
     MemoryReviewResponse,
     ReviewItem,
+    flagged_refs,
     parse_reply,
     render_review_text,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "Record",
     "ReviewItem",
     "__version__",
+    "flagged_refs",
     "parse_reply",
     "render_review_text",
 ]

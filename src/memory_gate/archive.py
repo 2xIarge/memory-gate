@@ -61,7 +61,13 @@ class Record:
 
     id: str
     role: str
-    turn: int
+    pass_no: int
+    """Which pass of the gate first saw this record leave the keep window.
+
+    Deliberately not a conversation turn: after the first compaction the live
+    message list no longer contains earlier turns, so any "turn number" read off
+    it would be wrong.
+    """
     ts: str
     tokens: int
     text: str

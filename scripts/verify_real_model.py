@@ -90,6 +90,30 @@ HARD = [
         question="这个项目的内部代号是什么？只回答代号。",
         must=(("青橙",),),
     ),
+    Constraint(
+        label="数据环境",
+        plant="查询走生产库那个只读副本，staging 的数据是脏的，谁也别往上写。",
+        question="这次分析连的是哪套环境？只回答环境名。",
+        must=(("生产", "prod"),),
+    ),
+    Constraint(
+        label="货币单位",
+        plant="金额一律换算成美元出报表，人民币的记得乘当季汇率。",
+        question="报表里的金额用什么货币单位？",
+        must=(("美元", "usd", "dollar"),),
+    ),
+    Constraint(
+        label="交付节奏",
+        plant="这个复盘每周五下班前必须交，拖到周一没人看。",
+        question="这个复盘多久交一次、卡在星期几？",
+        must=(("周五", "星期五", "friday"),),
+    ),
+    Constraint(
+        label="标题规范",
+        plant="图表标题记得带上季度号，不然是归档的时候根本检索不到。",
+        question="图表标题需要额外带上什么信息？",
+        must=(("季度",),),
+    ),
 ]
 
 # Unrelated chatter. The point is that no single summary narrative can carry it.
@@ -114,18 +138,51 @@ CHATTER = [
     "晚上十一点睡够八小时的话几点起？",
     "这段 Python 报 KeyError 一般是什么原因？",
     "给新人写一句欢迎语。",
+    "帮我把这段中文摘要翻成英文，别太书面。",
+    "会议室投影老断，是 HDMI 线的问题吗？",
+    "推荐一个 macOS 上的窗口管理工具。",
+    "这份报表发给老板之前要不要加一页结论？",
+    "我们组有人要休产假，人手怎么排？",
+    "帮我看看这段日志里有没有异常关键字。",
+    "PPT 里的中文字体用哪个比较稳？",
+    "季度目标怎么写才不至于太空？",
+    "楼下那家咖啡店涨价了，附近有平替吗？",
+    "帮我把这个 CSV 的前五行打出来看看。",
+    "这个字段命名是 snake_case 还是 camelCase？",
+    "团队周会要不要改成双周一次？",
+    "打印机又卡纸了，换个纸盒能解决吗？",
+    "把这段 SQL 改成参数化的，别拼字符串。",
+    "有没有适合新人的代码评审清单？",
+    "这个报错一般是什么权限问题？",
+    "帮我想个不那么俗的项目代号。",
+    "年底团建预算人均多少合适？",
+    "这份文档放 wiki 哪个目录比较好？",
+    "键盘手感差，换轴能救吗？",
+    "把上面几条结论合并成一段话。",
+    "客户问交付延期怎么解释比较得体？",
+    "这个表数据量多大，需要分页吗？",
+    "午饭吃啥，别太油。",
+    "帮我把这段正则解释一下。",
+    "我们的日志保留多久比较合规？",
 ]
 
 
 def hard_turns() -> list[str]:
-    """Interleave the planted constraints through the chatter."""
-    plants = {i: c.plant for i, c in zip([0, 2, 4, 6, 9, 12], HARD)}
+    """Interleave the planted constraints evenly through the chatter.
+
+    Spacing matters: a constraint planted right before a compaction boundary is
+    easy to keep, one planted many compactions ago is the hard case. Even
+    spacing samples both.
+    """
+    total = len(CHATTER) + len(HARD)
+    step = total // len(HARD)
+    positions = {min(total - 1, i * step + 1): c.plant for i, c in enumerate(HARD)}
     turns: list[str] = []
     chatter = list(CHATTER)
-    for i in range(len(CHATTER) + len(HARD)):
-        if i in plants:
-            turns.append(plants[i])
-        else:
+    for i in range(total):
+        if i in positions:
+            turns.append(positions[i])
+        elif chatter:
             turns.append(chatter.pop(0))
     return turns + ["就先这样，帮我把整体数字确认一遍。"]
 
@@ -155,6 +212,15 @@ def validate_questions(constraints: list[Constraint]) -> None:
     question as a correct answer.
     """
     for c in constraints:
+        if not isinstance(c.must, tuple) or not c.must:
+            raise MeasurementError(f"{c.label}: `must` must be a non-empty tuple of groups")
+        for gi, group in enumerate(c.must):
+            if not isinstance(group, tuple) or not group                     or not all(isinstance(k, str) and k for k in group):
+                raise MeasurementError(
+                    f"{c.label}: group #{gi} is {group!r}; every group must be a non-empty "
+                    "tuple of non-empty strings. A single group needs a trailing comma -- "
+                    '((a, b)) collapses to (a, b) and then scores on single characters.'
+                )
         low = c.question.lower()
         for group in c.must:
           for kw in group:
@@ -196,7 +262,13 @@ def ask(agent, config, question: str, resume_with: str) -> str:
 
     result = agent.invoke({"messages": [HumanMessage(content=question)]}, config=config)
     while "__interrupt__" in result:
-        result = agent.invoke(Command(resume=resume_with), config=config)
+        # resolve_resume, not the raw value: `resume_with` may be a policy
+        # callable, and Command(resume=<function>) makes LangGraph try to
+        # checkpoint a function and die in msgpack.
+        payload = result["__interrupt__"][0].value
+        result = agent.invoke(
+            Command(resume=resolve_resume(resume_with, payload)), config=config
+        )
     messages = result.get("messages", [])
     if not messages:
         raise MeasurementError(f"empty state after asking {question!r}")
@@ -261,7 +333,22 @@ def summary_ids(agent, config) -> set[str]:
     return out
 
 
-def run_turns(agent, config, turns, say, resume_with: str | None = None) -> int:
+def resolve_resume(resume_with, payload) -> str:
+    """`resume_with` is either a fixed reply or a policy callable."""
+    return resume_with(payload) if callable(resume_with) else resume_with
+
+
+def policy_flagged(payload) -> str:
+    """A realistic reviewer: pin only what the gate flagged, skip the rest."""
+    # module-level function, so it cannot see main()'s imports. Same trap as
+    # ask(): anything a top-level helper needs must be imported where it lives.
+    from memory_gate import flagged_refs
+
+    refs = flagged_refs(payload)
+    return "keep " + ",".join(str(r) for r in refs) if refs else "confirm"
+
+
+def run_turns(agent, config, turns, say, resume_with: str | None = None) -> tuple[int, int]:
     """Feed the transcript, draining gate interrupts. Returns compaction count.
 
     Counting by "did the message list get shorter" was wrong and reported zero
@@ -274,12 +361,17 @@ def run_turns(agent, config, turns, say, resume_with: str | None = None) -> int:
 
     trace: list[tuple[int, int]] = []
     seen: set[str] = set()
+    reviews = 0
     for text in turns:
         result = agent.invoke({"messages": [HumanMessage(content=text)]}, config=config)
         while "__interrupt__" in result:
             if resume_with is None:
                 raise MeasurementError("unexpected interrupt in a gate-less run")
-            result = agent.invoke(Command(resume=resume_with), config=config)
+            reviews = reviews + 1
+            payload = result["__interrupt__"][0].value
+            result = agent.invoke(
+                Command(resume=resolve_resume(resume_with, payload)), config=config
+            )
         new = summary_ids(agent, config) - seen
         if new:
             seen |= new
@@ -287,7 +379,7 @@ def run_turns(agent, config, turns, say, resume_with: str | None = None) -> int:
         trace.append((state_length(agent, config), state_tokens(agent, config)))
     say("  per-turn (messages, approx tokens):")
     say(f"    {trace}")
-    return len(seen)
+    return len(seen), reviews
 
 
 def main() -> int:
@@ -298,6 +390,10 @@ def main() -> int:
     ap.add_argument("--trigger-tokens", type=int, default=320)
     ap.add_argument("--keep-messages", type=int, default=4)
     ap.add_argument("--parts", default="AB")
+    ap.add_argument("--protect-budget", type=int, default=1200,
+                    help="cap on pinned tokens injected per model call")
+    ap.add_argument("--policy", choices=["all", "flagged"], default="all",
+                    help="how part B answers the gate: pin everything, or only flagged")
     args = ap.parse_args()
 
     buf = io.StringIO()
@@ -312,6 +408,10 @@ def main() -> int:
 
     turns = hard_turns() if args.scenario == "hard" else easy_turns()
     say(f"scenario: {args.scenario}  ({len(turns)} user turns, {len(HARD)} planted constraints)")
+    say(f"policy  : {args.policy}   trigger: ({'tokens'}, {args.trigger_tokens}) "
+        f"keep: ({'messages'}, {args.keep_messages})")
+    say(f"budget  : {args.protect_budget} tokens injected per call = "
+        f"{args.protect_budget / args.trigger_tokens:.0%} of the trigger")
 
     api_model = args.model or detect_model(args.base_url)
     if api_model is None:
@@ -348,8 +448,8 @@ def main() -> int:
         agent = create_agent(model=agent_model, tools=[], middleware=[make_summarizer()],
                              checkpointer=InMemorySaver())
         config = {"configurable": {"thread_id": f"{args.scenario}-a"}}
-        n_compact = run_turns(agent, config, turns, say)
-        say(f"  compaction cycles observed: {n_compact}")
+        n_compact, n_review = run_turns(agent, config, turns, say)
+        say(f"  compaction cycles observed: {n_compact}   gate reviews: {n_review}")
         say(f"  summary markers in final state: {summarize_markers(agent, config)}")
         if n_compact < 2:
             raise MeasurementError(
@@ -365,7 +465,7 @@ def main() -> int:
             answers[c.label] = ("PASS" if ok else "FAIL", out)
             say(f"  [{c.label}] {'OK  ' if ok else 'LOST'}  {out[:90]!r}")
         results["A"] = answers
-        meta["A"] = {"compactions": n_compact}
+        meta["A"] = {"compactions": n_compact, "reviews": n_review}
 
     if "B" in args.parts.upper():
         say("\n" + "=" * 70)
@@ -377,26 +477,30 @@ def main() -> int:
             archive_dir=archive_dir,
             summarization=summarizer,
             review_threshold_tokens=1,
+            protect_budget_tokens=args.protect_budget,
             protect_patterns=tuple(c.must[0][0] for c in HARD)
             + ("只用", "不用", "按这个来", "记一下"),
         )
         agent = create_agent(model=agent_model, tools=[], middleware=[gate, summarizer],
                              checkpointer=InMemorySaver())
         config = {"configurable": {"thread_id": f"{args.scenario}-b"}}
-        n_compact = run_turns(agent, config, turns, say, resume_with="keep all")
-        say(f"  compaction cycles observed: {n_compact}")
+        policy = policy_flagged if args.policy == "flagged" else "keep all"
+        n_compact, n_review = run_turns(agent, config, turns, say, resume_with=policy)
+        say(f"  compaction cycles observed: {n_compact}   gate reviews: {n_review}")
+        say(f"  gate interrupted {n_review} time(s)")
         say(f"  archive: {gate.archive.stats()}")
         if n_compact < 2:
             raise MeasurementError(f"PART B: only {n_compact} compaction(s) ran.")
         answers = {}
         for c in HARD:
-            out = ask(agent, config, c.question, resume_with="keep all")
+            out = ask(agent, config, c.question,
+                      resume_with=policy_flagged if args.policy == "flagged" else "keep all")
             ok = all(any(k.lower() in out.lower() for k in group)
                      for group in c.must)
             answers[c.label] = ("PASS" if ok else "FAIL", out)
             say(f"  [{c.label}] {'OK  ' if ok else 'LOST'}  {out[:90]!r}")
         results["B"] = answers
-        meta["B"] = {"compactions": n_compact}
+        meta["B"] = {"compactions": n_compact, "reviews": n_review}
 
     say("\n" + "=" * 70)
     say("RESULT")
@@ -408,7 +512,8 @@ def main() -> int:
     for p in parts:
         passed = sum(1 for v in results[p].values() if v[0] == "PASS")
         say(f"  part {p}: {passed}/{len(HARD)} survived   "
-            f"({meta[p]['compactions']} compaction cycles)")
+            f"({meta[p]['compactions']} compaction cycles, "
+            f"{meta[p]['reviews']} gate review(s))")
 
     lost_a = [c.label for c in HARD if results.get("A", {}).get(c.label, ("",))[0] == "FAIL"]
     if lost_a:

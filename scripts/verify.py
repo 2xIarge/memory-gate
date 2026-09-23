@@ -83,7 +83,7 @@ def stage2():
     try:
         arch = Archive(tmp)
         recs = [
-            Record(id=f"m{i}", role="human", turn=i, ts="t", tokens=10, text=f"msg {i}",
+            Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=10, text=f"msg {i}",
                    kind="dialogue" if i % 2 == 0 else "tool")
             for i in range(6)
         ]
@@ -428,16 +428,33 @@ def stage8():
         except ValueError as exc:
             record("missing trigger is refused", True, str(exc)[:60])
 
+        def msgs(n, reported=None):
+            from langchain_core.messages import AIMessage, HumanMessage
+            out = [HumanMessage(content=f"h{i}") for i in range(max(0, n - 1))]
+            ai = AIMessage(content="a")
+            if reported is not None:
+                ai.usage_metadata = {"input_tokens": reported, "output_tokens": 0,
+                                     "total_tokens": reported}
+            out.append(ai)
+            return out
+
         g = MemoryGateMiddleware(archive_dir=tmp / "b", trigger=("messages", 10))
         record("explicit trigger works standalone",
-               g._compaction_is_imminent(10, 0) and not g._compaction_is_imminent(9, 0))
+               g._compaction_is_imminent(msgs(10), 0) and not g._compaction_is_imminent(msgs(9), 0))
 
         g2 = MemoryGateMiddleware(
             archive_dir=tmp / "c", trigger=[{"tokens": 100, "messages": 5}, ("messages", 50)]
         )
         record("AND clause needs both",
-               g2._compaction_is_imminent(5, 100) and not g2._compaction_is_imminent(5, 99))
-        record("OR across clauses", g2._compaction_is_imminent(50, 0))
+               g2._compaction_is_imminent(msgs(5), 100)
+               and not g2._compaction_is_imminent(msgs(5), 99))
+        record("OR across clauses", g2._compaction_is_imminent(msgs(50), 0))
+        # the guarded middleware also fires on model-reported tokens
+        g4 = MemoryGateMiddleware(archive_dir=tmp / "e", trigger=("tokens", 500))
+        record("reported tokens alone make compaction imminent",
+               g4._compaction_is_imminent(msgs(6, reported=900), 120))
+        record("reported tokens below threshold do not",
+               not g4._compaction_is_imminent(msgs(6, reported=100), 120))
 
         summary = HumanMessage(
             content="Here is a summary of the conversation to date:\n\nx",
@@ -449,7 +466,7 @@ def stage8():
                _kind_of(HumanMessage(content="keep this")) == "dialogue")
 
         arch = Archive(tmp / "d")
-        arch.append([Record(id="x1", role="human", turn=1, ts="t", tokens=5,
+        arch.append([Record(id="x1", role="human", pass_no=1, ts="t", tokens=5,
                             text="fx rate rule", kind="dialogue")])
         g3 = MemoryGateMiddleware(archive_dir=tmp / "d", trigger=("messages", 2))
         rec = g3.restore("x1")
