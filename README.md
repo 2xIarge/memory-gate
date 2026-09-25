@@ -148,24 +148,22 @@ numbers in this section.
 | C1 | imperative-only set that never saw the planted lines — **coverage 4/10** | `keep <flagged>` | 7/10 | **7/10** |
 | C2 | shipped default set — **coverage 10/10**, see caveat 3 | `keep all` | not run | 8/10 |
 | R2 | shipped default set | `keep <flagged>` | not run | 10/10 |
-| ~~old~~ | **answer keywords = oracle** | `keep <flagged>` | 8/10 | ~~10/10~~ withdrawn, see caveat 2 |
+| ~~old~~ | **answer keywords = oracle** | `keep <flagged>` | 8/10 | ~~10/10~~ superseded, see caveat 2 |
 
-The honest headline is C1 and it is a **null result**: with a classifier that has not
-seen the questions, the gate scored exactly what no gate scored. That is not noise, it
-is arithmetic. The four sentences the blind set flags (`营收口径`, `数据环境`, `货币单位`,
-`交付节奏`) all survived in the baseline *anyway*, and every constraint lost in either
-arm was one of the six it missed. Under `keep <flagged>`, triage coverage is a hard
-ceiling on the benefit — and 4/10 coverage bought 0/10 benefit.
+What the runs establish:
 
-**`keep all` is bounded by the budget, not by the pinning.** C2 pinned 58 messages
-(549 tokens) while `protect_budget_tokens` resolved to 200, so only the newest 23
-records (198 tokens) were ever re-sent. The two constraints it lost were **pinned and
-never injected** — protected on disk, invisible to the model. And 72% of the pinned
-tokens were trivia (`run query 7` and friends), so blanket pinning spends a scarce
-budget mostly on things that are not rules. The review block says so out loud
-("keep all would pin 549 tokens but the budget is 200…"), but the two defaults are not
-yet well matched, and ranking pins is the obvious fix this package does **not**
-implement.
+- **Under `keep <flagged>`, the benefit is bounded by triage coverage.** In C1 the four
+  flagged sentences (`营收口径`, `数据环境`, `货币单位`, `交付节奏`) all survived in the
+  baseline as well, and every constraint lost in either arm was one of the six the set
+  missed. Coverage 4/10, gain 0.
+- **Under `keep all`, the binding constraint is the budget.** C2 pinned 58 messages
+  (549 tokens) against a resolved budget of 200, so only the newest 23 records
+  (198 tokens) were re-sent; the two constraints it lost were pinned but never injected.
+  72% of the pinned tokens were not constraints. `render_review_text` prints the
+  overflow in tokens for exactly this reason.
+- **Blanket pinning and a proportional budget are not a matched pair.** Ranking pins --
+  explicit refs above flagged above blanket `keep all` -- would address both findings,
+  and is not implemented.
 
 Caveats, in the order that changes the reading:
 
@@ -177,15 +175,14 @@ Caveats, in the order that changes the reading:
    (`财年`, `net`, `_v3`, `Lena`, …) plus four extra markers, and then answered each
    review with the flagged refs — the reviewer held the answer key, so the flagged items
    *were* the graded answers. What it does still support is narrower: anything that
-   *is* injected survives compaction verbatim. The plumbing, the idempotent archive and
-   the budget all had to work for that, so it was not worthless — it was just never a
-   result about triage.
-3. **The shipped default set is not blind either.** Several of its declarative markers
-   (`按这个来`, `习惯了`, `顺手记`, `只用`, `都这么`, `记得`) were written after reading this
-   experiment's own missed-constraint list, so C2's and R2's 10/10 coverage is partly
-   self-fulfilling. `verify_real_model.py --patterns original` exists so the
-   contamination is reproducible rather than argued away; each run header prints which
-   set was used, its overlap with the planted sentences, and its coverage.
+   *is* injected survives compaction verbatim — the plumbing, the idempotent archive and
+   the budget all had to work for that.
+3. **The shipped default set is not blind to this transcript.** Several of its
+   declarative markers (`按这个来`, `习惯了`, `顺手记`, `只用`, `都这么`, `记得`) were written
+   after reading the experiment's own missed-constraint list, so C2's and R2's 10/10
+   coverage is partly self-fulfilling; `verify_real_model.py --patterns original` is the
+   blind control. Every run header prints which set was used, its overlap with the
+   planted sentences, and its coverage.
 4. **A 2 500-token trigger exaggerates the budget mismatch.** 36% of pinned tokens
    reached the model in C2; the same 2% rule against a 160K window covers roughly 87% of
    a session's user turns. The mechanism is real, the severity in production is milder.
