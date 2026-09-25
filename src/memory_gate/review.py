@@ -203,10 +203,13 @@ def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72,
     the start of a long session lives.
 
     Rows are ordered rules-first, then oldest-first. A production-scale review
-    was measured at 403 lines / 27K characters for a 390-turn chat session
+    was measured at 403 lines / 16,497 characters for a 390-turn chat session
     (``scripts/render_at_scale.py``), which nobody reads; ordering plus a cap is
-    what makes the block skimmable, and the default action is deliberately one
-    word so that not reading it is still safe.
+    what makes the block skimmable. The default action is deliberately one word,
+    because a reviewer who does not read must still end up safe -- and it is the
+    budget line above that keeps that promise honest: `keep all` pins everything,
+    but only what fits the budget is re-sent, so the overflow is stated in tokens
+    rather than discovered as a missing rule twenty turns later.
     """
     items = req["items"]
     shown = sorted(items, key=lambda i: (not i.get("flagged"), i["ref"]))[:max_items]

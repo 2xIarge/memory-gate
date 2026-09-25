@@ -130,11 +130,19 @@ archived unconditionally, so it can be recovered afterwards with
 ``Archive.search``.
 
 Measured on held-out lines the set was not tuned against (see
-``scripts/score_patterns.py``): recall ~75%, precision ~100%, at the cost of
-flagging roughly a quarter of user messages. A declarative rule with no marker
-word at all -- "周报发给 Kevin，抄送整个组" -- is out of reach for any pattern
-list, which is why ``keep all`` is the review's default action and the flags are
-a reading aid rather than a filter.
+``scripts/score_patterns.py``): recall 93% and 83% on two separate corpora, precision
+93% and 100%, at the cost of flagging 17% of a real transcript. Note that this set is
+not blind to *every* corpus -- several declarative markers were written after reading
+the missed-constraint list of ``scripts/verify_real_model.py``, which is why that
+experiment's own coverage against those planted sentences is 10/10 by construction, and
+why it also offers ``--patterns original`` as the blind control.
+
+Treat the flags as a reading aid, never as a filter, for two reasons. A declarative
+rule with no marker word at all -- "周报发给 Kevin，抄送整个组" -- is out of reach for
+any pattern list. And in the blind control run, answering a review with `keep
+<flagged>` scored 7/10 against a 7/10 baseline: every constraint actually lost was one
+the patterns missed, so the coverage figure is a hard ceiling on what that policy can
+buy.
 """
 
 

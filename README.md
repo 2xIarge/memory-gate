@@ -138,62 +138,71 @@ compaction cannot take it back.
 
 ## Measured
 
-A real model (local Qwen through llama.cpp), a 57-turn session with 10 constraints
-planted among 40 unrelated topics, compaction firing 2–3 times. Asked about each
-constraint at the end:
+One model (local Qwen through llama.cpp), one 57-turn transcript with 10 constraints
+planted among 40 unrelated topics, trigger 2 500 tokens / keep 6 messages. Every
+configuration below is a **single** run — read the noise floor before comparing two
+numbers in this section.
 
-| | summarizer alone | with the gate |
-|---|---|---|
-| constraints surviving | **8/10** | **10/10** |
-| compaction cycles | 2 | 3 |
-| human interruptions | 0 | 3 |
-| tokens injected per call | 0 | 151 |
+| run | triage the reviewer was given | reviewer's answer | baseline alone | with the gate |
+|---|---|---|---|---|
+| C1 | imperative-only set that never saw the planted lines — **coverage 4/10** | `keep <flagged>` | 7/10 | **7/10** |
+| C2 | shipped default set — **coverage 10/10**, see caveat 3 | `keep all` | not run | 8/10 |
+| R2 | shipped default set | `keep <flagged>` | not run | 10/10 |
+| ~~old~~ | **answer keywords = oracle** | `keep <flagged>` | 8/10 | ~~10/10~~ withdrawn, see caveat 2 |
 
-**Read the next two limitations before quoting the table. Both are about how it was
-measured, not about the mechanism.**
+The honest headline is C1 and it is a **null result**: with a classifier that has not
+seen the questions, the gate scored exactly what no gate scored. That is not noise, it
+is arithmetic. The four sentences the blind set flags (`营收口径`, `数据环境`, `货币单位`,
+`交付节奏`) all survived in the baseline *anyway*, and every constraint lost in either
+arm was one of the six it missed. Under `keep <flagged>`, triage coverage is a hard
+ceiling on the benefit — and 4/10 coverage bought 0/10 benefit.
 
-1. *The gated run was handed the answer key.* It passed `protect_patterns` built from
-   the planted constraints' own keywords (`财年`, `net`, `_v3`, `Lena`, …) plus four
-   extra markers, and auto-answered each review with `keep <flagged refs>`. So the
-   triage in that run was an oracle, and the flagged items *were* the graded answers.
-   That setup cannot demonstrate that the product finds the right lines — it demonstrates
-   that anything which does get pinned survives three rounds of compaction and reaches
-   the model verbatim. That is the claim the table supports, and it is a real one:
-   the plumbing, the idempotent archive, the budget and the injection all had to work
-   for 10/10 to come out.
-2. *The defaults have since changed.* That run used a 300-token budget and an uncapped
-   review list; `protect_budget_tokens` is now a fraction of the trigger and
-   `render_review_text` caps what it displays. The shipped `DEFAULT_PROTECT_PATTERNS`
-   were imperative-only at the time and are the set scored in the next section.
+**`keep all` is bounded by the budget, not by the pinning.** C2 pinned 58 messages
+(549 tokens) while `protect_budget_tokens` resolved to 200, so only the newest 23
+records (198 tokens) were ever re-sent. The two constraints it lost were **pinned and
+never injected** — protected on disk, invisible to the model. And 72% of the pinned
+tokens were trivia (`run query 7` and friends), so blanket pinning spends a scarce
+budget mostly on things that are not rules. The review block says so out loud
+("keep all would pin 549 tokens but the budget is 200…"), but the two defaults are not
+yet well matched, and ranking pins is the obvious fix this package does **not**
+implement.
 
-So: 8/10 vs 10/10 is the shape of the failure and proof that pinning fixes it, not a
-score for the reviewer's judgement. `scripts/verify_real_model.py --policy "keep all"`
-with the default patterns and no keyword oracle is the run that would settle the second
-half; it has not been done yet.
+Caveats, in the order that changes the reading:
 
-Read the caveats with the table, they are the point:
-
-- **n = 1 per configuration.** One transcript, one model, one topic mix. This says the
-  mechanism fires and survives contact with a real model; it is not a benchmark.
-- **The baseline did not fail loudly.** For the two it lost it answered with a
-  plausible wrong fiscal calendar and a plausible wrong database environment.
-- **Loss depends on how aggressively you compact.** With a looser `keep`, the baseline
-  holds 10/10 as well. If you control the configuration, loosening compaction is
-  cheaper than adding a gate. This package is for the cases where you do not control
-  it — constrained context windows, shared agents, tool-heavy sessions.
-- **One review per compaction, not extra nagging.** Review count tracked compaction
-  count exactly; the gate asked 3 times over 57 turns.
-
-The two things that decided the outcome were not the gate's cleverness:
-
-- `pin_roles` defaults to `("human",)`. The assistant restates your rules in its own
-  words; pinning those too spent the same budget on redundant text and roughly halved
-  how many distinct constraints fitted.
-- The injection budget has to stay small relative to the trigger. Pinned text is
-  re-sent and re-counted every call, so a budget comparable to the trigger re-arms the
-  compaction it just survived. Measured: 2 cycles became 31. `protect_budget_tokens`
-  therefore defaults to 2% of the trigger (clamped to [200, 4000]) rather than a
-  constant, and warns when an explicit value is over 10% of it.
+1. **n = 1 per configuration, and the baseline itself is noisy.** The same Part A
+   transcript scored 7/10 on one run and 8/10 on another. A difference of one is inside
+   the noise; 7 vs 10 is not.
+2. **The 8/10 → 10/10 result this README used to lead with is withdrawn.** That run
+   passed `protect_patterns` built from the planted constraints' own answer keywords
+   (`财年`, `net`, `_v3`, `Lena`, …) plus four extra markers, and then answered each
+   review with the flagged refs — the reviewer held the answer key, so the flagged items
+   *were* the graded answers. What it does still support is narrower: anything that
+   *is* injected survives compaction verbatim. The plumbing, the idempotent archive and
+   the budget all had to work for that, so it was not worthless — it was just never a
+   result about triage.
+3. **The shipped default set is not blind either.** Several of its declarative markers
+   (`按这个来`, `习惯了`, `顺手记`, `只用`, `都这么`, `记得`) were written after reading this
+   experiment's own missed-constraint list, so C2's and R2's 10/10 coverage is partly
+   self-fulfilling. `verify_real_model.py --patterns original` exists so the
+   contamination is reproducible rather than argued away; each run header prints which
+   set was used, its overlap with the planted sentences, and its coverage.
+4. **A 2 500-token trigger exaggerates the budget mismatch.** 36% of pinned tokens
+   reached the model in C2; the same 2% rule against a 160K window covers roughly 87% of
+   a session's user turns. The mechanism is real, the severity in production is milder.
+5. **Loss depends on how aggressively you compact.** Loosen `keep` and the baseline
+   holds 10/10 on its own; if you control that setting, changing it is cheaper than
+   adding a gate. This package is for configurations you do not control — constrained
+   context windows, shared agents, tool-heavy sessions.
+6. **One review per compaction, not nagging** — C2 asked 5 times and compacted 5 times
+   over 57 turns. Pinning does raise reported usage, which is the runaway the budget
+   exists to cap (measured: 2 cycles became 31 with a budget near half the trigger).
+7. `pin_roles` defaults to `("human",)`. The assistant restates your rules in its own
+   words; pinning those too spent the same budget on redundant text and roughly halved
+   how many distinct constraints fitted.
+8. `protect_budget_tokens` defaults to 2% of the trigger (clamped to [200, 4000])
+   rather than a constant, and warns when an explicit value is over 10% of it — because
+   pinned text is re-sent and re-counted every call, a budget comparable to the trigger
+   re-arms the compaction it just survived. Caveat 4 is the cost of that being too small.
 
 ## Which lines look like rules
 
