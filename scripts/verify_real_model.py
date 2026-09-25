@@ -422,11 +422,16 @@ def main() -> int:
                          "the library default (2% of the trigger)")
     ap.add_argument("--policy", choices=["all", "flagged"], default="all",
                     help="how part B answers the gate: pin everything, or only flagged")
-    ap.add_argument("--patterns", choices=["oracle", "default"], default="default",
+    ap.add_argument("--patterns", choices=["oracle", "default", "original"],
+                    default="default",
                     help="oracle = protect_patterns built from the planted constraints' "
-                         "own keywords, i.e. the reviewer holds the answer key. That is "
-                         "what the first real-model run did, and it cannot say anything "
-                         "about triage. default = the shipped DEFAULT_PROTECT_PATTERNS.")
+                         "answer keywords, i.e. the reviewer holds the answer key. "
+                         "default = the shipped DEFAULT_PROTECT_PATTERNS, which is NOT "
+                         "blind either: several of its declarative markers were added "
+                         "after reading this experiment's missed sentences (see the leak "
+                         "check it prints). original = the imperative-only set that "
+                         "shipped before any of that, the only one with no knowledge of "
+                         "the planted lines, and therefore the honest triage control.")
     args = ap.parse_args()
 
     # One tag for one configuration, used for the archive directory, the graph
@@ -529,19 +534,44 @@ def main() -> int:
         planted_keys = tuple(c.must[0][0] for c in HARD)
         if args.patterns == "oracle":
             chosen = planted_keys + ("只用", "不用", "按这个来", "记一下")
+        elif args.patterns == "original":
+            # Imported rather than copied: score_patterns.py owns the frozen
+            # history, and a second literal here would drift the moment that file
+            # is corrected -- which is exactly how the derived control group in it
+            # stopped being a control group once.
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from score_patterns import ORIGINAL
+            chosen = tuple(ORIGINAL)
         else:
             chosen = tuple(DEFAULT_PROTECT_PATTERNS)
-            # The whole point of --patterns default is that the reviewer does not
-            # know the answers. Report any accidental overlap instead of assuming
-            # there is none: `口径` ships in the default set and is also a word the
-            # revenue constraint uses, and a reader of this report is entitled to
-            # know that the comparison is not perfectly clean.
-            leak = [k for k in planted_keys
+
+        # Three numbers, no verdict printed. Two of them are about contamination
+        # and they mean different things:
+        #  * answer-keyword overlap is fatal -- the reviewer knows what the grader
+        #    looks for. `--patterns oracle` is the only configuration with this.
+        #  * verbatim phrase overlap merely says a marker also occurs inside a
+        #    planted sentence. That is true of `必须` and `口径` in the original set,
+        #    which predate the experiment, and of `按这个来` / `习惯了` / `顺手记` in
+        #    the shipped default, which were added today *after* reading this
+        #    experiment's missed-constraint list. A checker cannot tell those apart,
+        #    so provenance has to be read from the comments, not inferred.
+        # Coverage is the number that makes a run interpretable at all: how many of
+        # the 10 planted sentences the chosen set flags. It costs no model calls.
+        key_leak = [k for k in planted_keys
                     if any(k.lower() in p.lower() or p.lower() in k.lower()
                            for p in chosen)]
-            say(f"  oracle leak check: planted answer keywords also present in the "
-                f"default set -> {leak or 'none'}")
+        compiled = [re.compile(p, re.IGNORECASE) for p in chosen]
+        phrase_leak = sorted({p for c in HARD for p in chosen
+                              if len(p) >= 2 and not p.startswith("\\")
+                              and p in c.plant})
+        flagged = [c.label for c in HARD
+                   if any(rx.search(c.plant) for rx in compiled)]
         say(f"  patterns: {args.patterns} ({len(chosen)} entries)")
+        say(f"  answer-keyword overlap: {key_leak or 'none'}")
+        say(f"  verbatim phrase overlap: {phrase_leak or 'none'}")
+        say(f"  triage coverage: flags {len(flagged)}/{len(HARD)} planted sentences"
+            + (f" -- misses {sorted(set(HARD[i].label for i in range(len(HARD))) - set(flagged))}"
+               if len(flagged) != len(HARD) else ""))
         gate = MemoryGateMiddleware(
             archive_dir=archive_dir,
             summarization=summarizer,
@@ -583,14 +613,23 @@ def main() -> int:
             f"({meta[p]['compactions']} compaction cycles, "
             f"{meta[p]['reviews']} gate review(s))")
 
-    lost_a = [c.label for c in HARD if results.get("A", {}).get(c.label, ("",))[0] == "FAIL"]
-    if lost_a:
-        say(f"\n>>> PART A lost {len(lost_a)} constraint(s) under compaction: {', '.join(lost_a)}")
-        say(">>> that is the failure this package exists to make visible and recoverable.")
+    if "A" not in results:
+        # `results.get("A", {})` made an unrun Part A look identical to a Part A
+        # that lost nothing, and the else-branch below then printed "PART A lost
+        # nothing even on the adversarial transcript" -- the precise inverse of the
+        # truth, in a file whose whole purpose is to be quoted as evidence.
+        say("\n>>> PART A did not run (--parts B), so this says NOTHING about the baseline.")
+        say(">>> Do not read part B's score as a comparison; no control was measured.")
     else:
-        say("\n>>> PART A lost nothing even on the adversarial transcript.")
-        say(">>> The 'models drop constraints' premise is NOT supported by this run.")
-        say(">>> Consider selling audit + recovery instead of loss-prevention.")
+        lost_a = [c.label for c in HARD if results["A"][c.label][0] == "FAIL"]
+        if lost_a:
+            say(f"\n>>> PART A lost {len(lost_a)} constraint(s) under compaction:"
+                f" {', '.join(lost_a)}")
+            say(">>> that is the failure this package exists to make visible and recoverable.")
+        else:
+            say("\n>>> PART A lost nothing even on the adversarial transcript.")
+            say(">>> The 'models drop constraints' premise is NOT supported by this run.")
+            say(">>> Consider selling audit + recovery instead of loss-prevention.")
 
     write_report(buf.getvalue())
     print(f"\nreport -> {report_files()[0]}")
