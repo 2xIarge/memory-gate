@@ -90,6 +90,14 @@ class MemoryReviewRequest(TypedDict):
 
     allowed: list[str]
     omitted_previews: NotRequired[list[str]]
+    budget_tokens: NotRequired[int]
+    """``protect_budget_tokens`` of the gate that built this request.
+
+    Carried so the rendering can say what ``keep all`` will actually cost and
+    which end of the conversation the overflow falls off. Without it the
+    reviewer approves a pin set blind and discovers the oldest rules went
+    missing several turns later.
+    """
 
 
 class MemoryReviewResponse(TypedDict):
@@ -184,40 +192,80 @@ def parse_reply(reply: Any, valid_refs: set[int]) -> MemoryReviewResponse:
     return {"mode": "unrecognized", "keep_refs": [], "raw": text}
 
 
-def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72) -> str:
-    """Render a request as a plain-chat review block. No LLM involved."""
-    flagged = [i for i in req["items"] if i.get("flagged")]
+def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72,
+                       max_items: int = 40) -> str:
+    """Render a request as a plain-chat review block. No LLM involved.
+
+    ``max_items`` caps what is *printed*, never what is pinnable: the payload
+    keeps every candidate so refs stay addressable and ``keep all`` still covers
+    the rows that did not fit on screen. Capping by the protect budget instead
+    would hide exactly the oldest messages, which is where a rule stated once at
+    the start of a long session lives.
+
+    Rows are ordered rules-first, then oldest-first. A production-scale review
+    was measured at 403 lines / 27K characters for a 390-turn chat session
+    (``scripts/render_at_scale.py``), which nobody reads; ordering plus a cap is
+    what makes the block skimmable, and the default action is deliberately one
+    word so that not reading it is still safe.
+    """
+    items = req["items"]
+    shown = sorted(items, key=lambda i: (not i.get("flagged"), i["ref"]))[:max_items]
+    hidden = len(items) - len(shown)
+    flagged_n = sum(1 for i in items if i.get("flagged"))
+    mixed_roles = len({i["role"] for i in shown}) > 1
+
     lines = [
-        f"About to compact {req['dropped_total']} messages "
-        f"({req['dropped_tokens']} tokens of dialogue).",
-        "After compaction these survive only as a lossy summary.",
-        "Reply with refs to pin them permanently:",
-        "",
+        f"Compaction will drop {req['dropped_total']} messages."
+        f" {len(items)} of them are dialogue you can keep"
+        f" ({req['dropped_tokens']} tokens).",
+        "The rest survive only as a lossy summary."
+        " Nothing is deleted -- all of it stays in the archive.",
     ]
-    for item in req["items"]:
+
+    budget = req.get("budget_tokens")
+    if budget and req["dropped_tokens"] > budget:
+        lines.append(
+            f"keep all would pin {req['dropped_tokens']} tokens but the budget is"
+            f" {budget}: the oldest {req['dropped_tokens'] - budget} tokens stay in the"
+            " archive and are not re-sent to the model."
+        )
+    if hidden > 0:
+        lines.append(
+            f"Showing {len(shown)} of {len(items)} -- rules first, then oldest."
+            f" The {hidden} not shown are still pinnable and are covered by keep all."
+        )
+    lines.append("")
+
+    for item in shown:
         preview = item["preview"].replace("\n", " ")
         if len(preview) > preview_width:
             preview = preview[: preview_width - 1] + "\u2026"
         mark = "*" if item.get("flagged") else " "
-        lines.append(
-            f" [{item['ref']:>2}]{mark} #{item['id']:<10} {item['tokens']:>5} tok  "
-            f"{item['role']:<9} {preview}"
-        )
-    if flagged:
-        refs = ",".join(str(i["ref"]) for i in flagged)
-        lines.append("")
-        lines.append(" * matched a protect pattern -- looks like a standing constraint,")
-        lines.append(f"   not chatter. Those refs: {refs}")
+        role = f" {item['role']:<9}" if mixed_roles else ""
+        lines.append(f" [{item['ref']:>4}]{mark} {item['tokens']:>4} tok {role} {preview}")
+
+    if flagged_n:
+        lines += [
+            "",
+            f" * matched a protect pattern: {flagged_n} of {len(items)} look like a"
+            " standing rule.",
+            "   The patterns miss some real rules, so an unmarked line is not a line"
+            " you can afford to lose.",
+        ]
     if req.get("omitted"):
-        lines.append("")
-        lines.append(
-            f" {req['omitted']} more messages are also being dropped but are not"
-            " listed (tool results, and assistant replies unless pin_roles is widened)."
-        )
+        lines += [
+            "",
+            f" {req['omitted']} further messages are being dropped and are not listed"
+            " (tool results, and assistant replies unless pin_roles is widened).",
+        ]
+    # Built from refs actually on screen: a hard-coded "keep 3,8,11" invited
+    # replies naming items that do not exist, which parse_reply cannot resolve
+    # and therefore treats as keep-everything.
+    example = ",".join(str(i["ref"]) for i in sorted(shown[:3], key=lambda i: i["ref"])) or "1"
     lines += [
         "",
-        "  keep 1,3,5   pin the listed refs",
-        "  keep all     pin everything listed",
-        "  confirm      compact without pinning",
+        f"  keep all     pin all {len(items)}, budget permitting   <- the usual answer",
+        f"  keep {example}  pin only these refs",
+        "  confirm      compact and pin nothing new",
     ]
     return "\n".join(lines)

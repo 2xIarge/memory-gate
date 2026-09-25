@@ -86,19 +86,55 @@ except Exception:  # pragma: no cover - very old langchain-core
 
 
 DEFAULT_PROTECT_PATTERNS: tuple[str, ...] = (
-    # English constraint markers
+    # --- imperative markers: "you must", "don't", "禁止" ---
     r"\bmust\b", r"\bnever\b", r"\balways\b", r"\bdo not\b", r"\bdon't\b",
     r"\bforbidden\b", r"\brequire[sd]?\b", r"\bconstraint\b", r"\bpolicy\b",
     r"\bcomply\b", r"\bcompliance\b", r"\bonly use\b", r"\bremember\b",
-    # Chinese constraint markers
     r"必须", r"不允许", r"不得", r"禁止", r"一律", r"务必", r"口径",
-    r"约定", r"记住", r"千万", r"只能", r"不要", r"别",
+    r"约定", r"记住", r"千万", r"只能", r"不许",
+    # --- declarative markers: constraints are usually stated as facts ---
+    # "our fiscal year starts in April", "the contact is Lena", "we use UTC".
+    # The imperative half alone caught 4 of 10 constraints in a recorded run
+    # because people declare conventions far more often than they command them.
+    r"\bwe (use|always|never|only|call|prefer|default to)\b",
+    r"\bour [\w ]{1,20} (is|are|starts?|runs?|lives?)\b",
+    r"\bby convention\b", r"\bfor future reference\b", r"\bnote that\b",
+    r"\bgoing forward\b", r"\bfrom now on\b", r"\bis called\b",
+    r"\bwe refer to\b", r"\bheads[- ]up\b", r"\bFYI\b",
+    r"\bread-?only\b", r"\bnobody\b", r"\bno one\b",
+    r"记得", r"记一下", r"顺手记", r"记下来",
+    r"都这么", r"按这个来", r"习惯了", r"统一", r"一贯", r"向来",
+    r"按[^，。？！；\n]{1,12}(走|来|算|记)",
+    r"只认", r"只用", r"只保留", r"固定为", r"固定用",
+    # The gap must not span sentence-ending punctuation: with only ，。 excluded,
+    # "我们的 Q1 覆盖哪几个月？只回答月份。" read as one declaration and flagged a
+    # question. A convention is stated inside a single clause. The copula also
+    # refuses a question word after it, because "内部代号是什么？" asks rather
+    # than declares while matching the same shape as "对接人是 Lena".
+    r"(我们|咱们|这边|内部|公司|团队|部门|组里)[^，。？！；\n]{0,12}"
+    r"(是|用|只|都|统一|按|叫|走|默认|不叫)(?!什么|哪|吗|呢|谁|多少)",
+    r"(负责人|对接人|联系人|owner)(是|叫)(?!什么|哪|吗|呢|谁|多少)",
+    # --- directives with the noisy readings excluded ---
+    # Bare `不要` fired inside `要不要`, which asks a question rather than
+    # forbidding anything; bare `别` fired on 别的/特别/别人/别太. Dropping them
+    # outright measured worse -- it lost 别用 seaborn and 别迟到 -- so the
+    # ambiguous followers are excluded instead.
+    r"(?<!要)不要",
+    r"别(?!人|太|的|致|样|处)",
 )
 """Heuristics that flag an utterance as a likely durable constraint.
 
-These only decide *whether to ask*. They never decide what is kept, and a miss
-is not fatal: the message is still archived unconditionally, so it can be
-recovered afterwards with ``Archive.search``.
+These only decide *whether to ask* and how the review list is ordered. They
+never decide what is kept, and a miss is not fatal: the message is still
+archived unconditionally, so it can be recovered afterwards with
+``Archive.search``.
+
+Measured on held-out lines the set was not tuned against (see
+``scripts/score_patterns.py``): recall ~75%, precision ~100%, at the cost of
+flagging roughly a quarter of user messages. A declarative rule with no marker
+word at all -- "周报发给 Kevin，抄送整个组" -- is out of reach for any pattern
+list, which is why ``keep all`` is the review's default action and the flags are
+a reading aid rather than a filter.
 """
 
 
@@ -177,7 +213,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         protect_patterns: Sequence[str] | None = None,
         pin_roles: Sequence[str] = ("human",),
         preview_chars: int = 120,
-        protect_budget_tokens: int = 1200,
+        protect_budget_tokens: int | None = None,
         inject: bool = True,
         enabled: bool = True,
         token_counter: Callable[[Sequence[Any]], int] | None = None,
@@ -206,7 +242,12 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 model call. Without one the injection raises the reported token count,
                 which trips the compaction trigger, which causes another review, which
                 pins more -- a runaway. Measured: 2 compaction cycles became 31.
-                Overflow is omitted and declared, never silently dropped.
+                Defaults to 2% of the earliest token trigger, clamped to
+                [200, 4000]: a constant is wrong at both ends, being ~half of a
+                small window and far too little of a 200K one.
+                Overflow is omitted and declared, never silently dropped -- and note
+                the overflow is the *oldest* pins, so a rule stated once at the start
+                of a long session is the first thing a too-small budget loses.
             inject: Re-inject pinned items on every model call.
             enabled: Kill switch; a disabled gate archives and injects nothing.
             token_counter: Override the estimator.
@@ -239,7 +280,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 "memory-gate: pin_roles is empty, so nothing could ever be offered "
                 "for pinning -- a review gate with no candidates never fires."
             )
-        if protect_budget_tokens < 100:
+        if protect_budget_tokens is not None and protect_budget_tokens < 100:
             raise ValueError(
                 "memory-gate: protect_budget_tokens must be >= 100; a tiny budget "
                 "injects nothing while still looking armed -- the silent no-op "
@@ -249,7 +290,6 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         self.archive = Archive(archive_dir)
         self.review_threshold_tokens = review_threshold_tokens
         self.preview_chars = preview_chars
-        self.protect_budget_tokens = protect_budget_tokens
         self.inject = inject
         self.enabled = enabled
         self._summarization = summarization
@@ -257,6 +297,16 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             trigger if trigger is not None else getattr(summarization, "trigger", None)
         )
         self._fraction_limit = self._resolve_fraction_limit(summarization)
+        if protect_budget_tokens is None:
+            # A constant default is wrong at both ends: 1 200 tokens is 48% of a
+            # 2 500-token trigger, which re-arms compaction every call, and 0.6%
+            # of a 200K window, which cannot hold one session's rules -- the
+            # recorded run needed ~3 700 tokens for 390 user turns. Scale it.
+            earliest = self._earliest_trigger_tokens()
+            protect_budget_tokens = (
+                max(200, min(4_000, int(0.02 * earliest))) if earliest is not None else 1_200
+            )
+        self.protect_budget_tokens = protect_budget_tokens
         self._keep_messages = self._resolve_keep_messages(summarization, keep_messages)
         if summarization is None and keep_messages is None:
             # Observed in the wild: a gate configured with only a trigger silently
@@ -268,6 +318,21 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 f"defaults to {self._keep_messages}. If the middleware you guard keeps "
                 "a different number, this gate mis-times its reviews and may never "
                 "fire at all -- pass summarization=<instance> or keep_messages=<n>.",
+                stacklevel=2,
+            )
+        earliest = self._earliest_trigger_tokens()
+        if earliest is not None and protect_budget_tokens > 0.10 * earliest:
+            # Injected text is counted by the model on the next call, so a large
+            # budget re-arms the trigger it was meant to survive. Measured: with a
+            # budget at ~half the trigger, 2 compaction cycles became 31.
+            warnings.warn(
+                "memory-gate: protect_budget_tokens="
+                f"{protect_budget_tokens} is {protect_budget_tokens / earliest:.0%} of the "
+                f"{earliest}-token compaction trigger. Pinned text is re-sent on every "
+                "call and counted by the model, so a budget this large re-arms the "
+                "trigger it just survived: measured, 2 compaction cycles became 31. "
+                "Keep the budget well under 10% of the trigger, and treat `keep all` "
+                "as unsafe in this configuration.",
                 stacklevel=2,
             )
         self._patterns = [
@@ -301,6 +366,22 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
                 out.extend(MemoryGateMiddleware._normalize_trigger(item))
             return out
         return [{"messages": 0.0}]
+
+    def _earliest_trigger_tokens(self) -> int | None:
+        """Smallest token threshold that can fire, or None if it is not token-based.
+
+        Clauses are OR'd, so the lowest one binds. A ``fraction`` clause resolves
+        against the model's window when that is known; a purely message-based
+        trigger has no token figure to compare a budget against, and guessing one
+        would warn about a configuration that may be perfectly safe.
+        """
+        thresholds: list[float] = []
+        for clause in self._trigger:
+            if "tokens" in clause:
+                thresholds.append(clause["tokens"])
+            elif "fraction" in clause and self._fraction_limit:
+                thresholds.append(clause["fraction"] * self._fraction_limit)
+        return int(min(thresholds)) if thresholds else None
 
     @staticmethod
     def _resolve_fraction_limit(summarization: Any) -> int | None:
@@ -520,6 +601,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             "items": items,
             "omitted": len(zone) - len(candidates),
             "allowed": ["keep_selected", "keep_all", "confirm"],
+            "budget_tokens": self.protect_budget_tokens,
         }
 
         payload = {"type": "memory_gate_review", **request, "text": render_review_text(request)}

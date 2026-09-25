@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -451,3 +452,118 @@ def test_compaction_summaries_are_never_offered_for_review(workdir: Path) -> Non
     for payload in interrupts:
         previews = " ".join(i["preview"] for i in payload["items"])
         assert "summary of the conversation" not in previews.lower()
+
+
+def _budget_warnings(gate_kwargs) -> list[str]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        MemoryGateMiddleware(**gate_kwargs)
+    return [str(w.message) for w in caught if "protect_budget_tokens" in str(w.message)]
+
+
+def test_budget_near_the_trigger_warns(workdir: Path) -> None:
+    """Pinned text is re-sent and re-counted every call, so a budget comparable
+    to the trigger re-arms the compaction it just survived. Measured: 2 cycles
+    became 31. `keep all` is the review's default action, which makes this a
+    configuration a user can fall into without meaning to."""
+    msgs = _budget_warnings({"archive_dir": workdir, "trigger": ("tokens", 1_000),
+                             "keep_messages": 4, "protect_budget_tokens": 500})
+    assert msgs, "a budget at half the trigger passed silently"
+    assert "31" in msgs[0], "the warning should carry the measured consequence"
+
+
+def test_budget_well_under_the_trigger_is_quiet(workdir: Path) -> None:
+    """The production shape -- 160K trigger, a few thousand tokens of pins --
+    must not warn, or the warning is noise and gets ignored."""
+    assert not _budget_warnings({"archive_dir": workdir, "trigger": ("tokens", 160_000),
+                                 "keep_messages": 4, "protect_budget_tokens": 3_200})
+
+
+def test_message_trigger_does_not_invent_a_token_budget(workdir: Path) -> None:
+    """A message-count trigger has no token figure to compare against. Guessing
+    one would warn about configurations that may be perfectly safe."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 6),
+                                keep_messages=4, protect_budget_tokens=5_000)
+    assert gate._earliest_trigger_tokens() is None
+    assert not _budget_warnings({"archive_dir": workdir, "trigger": ("messages", 6),
+                                 "keep_messages": 4, "protect_budget_tokens": 5_000})
+
+
+@pytest.mark.parametrize("trigger,expected", [
+    (("tokens", 160_000), 3_200),   # 2% of a production window
+    (("tokens", 2_500), 200),       # clamped up: 2% would hold nothing
+    (("tokens", 500_000), 4_000),   # clamped down: 2% would re-arm the trigger
+    (("messages", 6), 1_200),       # no token figure to scale from
+])
+def test_default_budget_scales_with_the_trigger(workdir: Path, trigger, expected) -> None:
+    """A constant default was wrong at both ends: 1 200 tokens is ~half of a
+    2 500-token trigger (which re-armed compaction every call) and 0.6% of a
+    200K window (which cannot hold one session's rules)."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=trigger, keep_messages=4)
+    assert gate.protect_budget_tokens == expected
+    assert not _budget_warnings({"archive_dir": workdir, "trigger": trigger,
+                                 "keep_messages": 4}), \
+        "the shipped default must not trip the library's own budget warning"
+
+
+def test_tiny_windows_warn_even_on_the_default(workdir: Path) -> None:
+    """Below a ~2 000-token trigger the 200-token floor is already over 10%, so
+    the default warns. That is not a bug to suppress: on a window that small no
+    budget able to hold a single rule can also stay out of the trigger's way.
+    Recording it here so the boundary is a decision rather than a surprise."""
+    msgs = _budget_warnings({"archive_dir": workdir, "trigger": ("tokens", 500),
+                             "keep_messages": 4})
+    assert msgs, "a 200-token budget on a 500-token trigger should not pass quietly"
+    assert "40%" in msgs[0]
+
+
+DECLARATIVE_CONSTRAINTS = (
+    "对了我们财年是从 4 月 1 号起的，你按 4 到 6 月当第一季度。",
+    "这个项目的对接人是 Lena，后面邮件直接发她。",
+    "Our fiscal year starts in April.",
+    "We use UTC for all timestamps in the logs.",
+    "The staging database is read-only, nobody writes to it.",
+    "版本号按 SemVer 走。",
+    "客户那边只认 PDF。",
+    "每周三下午三点站会，别迟到。",
+)
+
+NOT_CONSTRAINTS = (
+    "要不要一起去看电影？",
+    "要不要试试换个写法？",
+    "明天会降温吗，要不要给孩子加件外套？",
+    "今天午饭吃啥？",
+    "Which movie should I watch tonight?",
+    # A probe question from the verification harness. `只回答` was added to the
+    # pattern list after reading a transcript full of these, which made the
+    # scorer's own questions look like standing rules -- a leak from the test
+    # fixture into the shipped defaults, caught by rendering at scale.
+    "我们的 Q1 覆盖哪几个月？只回答月份。",
+    # Same shape as a declaration, but asking: "内部代号是什么" matches the
+    # 内部 + copula pattern that catches "对接人是 Lena".
+    "这个项目的内部代号是什么？只回答代号。",
+    "对接人是谁？",
+)
+
+
+def test_declarative_constraints_are_flagged(workdir: Path) -> None:
+    """The shipped pattern list was imperative-only (must/never/必须/一律) and
+    scored recall 4/10 on the constraints planted in a recorded run, because
+    people state conventions as facts far more often than as commands. These are
+    the sentences it used to miss; `scripts/score_patterns.py` holds the corpora
+    and the held-out numbers."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 160_000),
+                                keep_messages=4)
+    for text in DECLARATIVE_CONSTRAINTS:
+        assert gate._is_risky(text), f"declarative constraint not flagged: {text}"
+
+
+def test_questions_are_not_flagged_as_prohibitions(workdir: Path) -> None:
+    """`不要` fired inside `要不要` and bare `别` fired on 别太/别的, which made
+    ordinary questions look like standing rules -- 6 of the 10 flags in the
+    recorded run were this. Dropping those patterns outright measured worse, so
+    the ambiguous readings are excluded instead."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 160_000),
+                                keep_messages=4)
+    for text in NOT_CONSTRAINTS:
+        assert not gate._is_risky(text), f"chatter flagged as a constraint: {text}"
