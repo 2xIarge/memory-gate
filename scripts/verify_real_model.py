@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -462,14 +463,28 @@ def main() -> int:
     else:
         say(f"budget  : {args.protect_budget} tokens injected per call = "
             f"{args.protect_budget / args.trigger_tokens:.0%} of the trigger")
+    # One line per mode, naming the mode actually selected: this used to branch on
+    # `oracle` versus everything-else, so a --patterns original run announced itself
+    # as the shipped defaults. A provenance label that disagrees with the command
+    # line is worse than no label in a file that exists to be quoted as evidence.
     if args.patterns == "oracle":
         say("triage  : **ORACLE** -- protect_patterns are the planted constraints' own "
-            "keywords.\n          This run can show that pinning survives compaction. It "
-            "cannot show that the\n          flag set finds the right lines; do not "
-            "quote it as if it could.")
+            "answer keywords.\n"
+            "          Can show that pinning survives compaction. Cannot say anything "
+            "about triage.")
+    elif args.patterns == "original":
+        say("triage  : ORIGINAL imperative-only set, frozen from before today's marker "
+            "work.\n"
+            "          The only control that never saw the planted sentences; its "
+            "coverage is printed in\n"
+            "          part B, and that pairing is what makes the score there "
+            "interpretable.")
     else:
-        say("triage  : shipped DEFAULT_PROTECT_PATTERNS -- the reviewer gets no keyword "
-            "advantage\n          against the planted constraints.")
+        say("triage  : shipped DEFAULT_PROTECT_PATTERNS -- no answer keywords, but NOT "
+            "blind:\n"
+            "          several declarative markers were added today after reading this "
+            "experiment's\n"
+            "          missed-constraint list, so expect high coverage by construction.")
 
     api_model = args.model or detect_model(args.base_url)
     if api_model is None:
