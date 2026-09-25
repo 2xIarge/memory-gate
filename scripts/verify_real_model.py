@@ -367,11 +367,18 @@ def run_turns(agent, config, turns, say, resume_with: str | None = None) -> tupl
         while "__interrupt__" in result:
             if resume_with is None:
                 raise MeasurementError("unexpected interrupt in a gate-less run")
-            reviews = reviews + 1
+            reviews += 1
             payload = result["__interrupt__"][0].value
-            result = agent.invoke(
-                Command(resume=resolve_resume(resume_with, payload)), config=config
-            )
+            # Capture what a human would actually see. Statistics alone hid the
+            # fact that no run had ever recorded a review block.
+            say("")
+            say(f"  ===== REVIEW {reviews} (after turn {len(trace) + 1}) =====")
+            for line in str(payload.get("text", "")).splitlines():
+                say("  " + line)
+            answer = resolve_resume(resume_with, payload)
+            say(f"  you -> {answer!r}")
+            say("  ========================================")
+            result = agent.invoke(Command(resume=answer), config=config)
         new = summary_ids(agent, config) - seen
         if new:
             seen |= new
