@@ -40,6 +40,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT = ROOT / ".scratch" / "real_model_report.txt"
+_RUN_TAG: str | None = None
+
+
+def report_files() -> list[Path]:
+    """Where to write: a per-configuration file first, then the stable "latest".
+
+    Sharing one path across runs meant the second configuration of an evening
+    overwrote the evidence from the first, and the only copy left said nothing
+    about which policy produced it.
+    """
+    out = []
+    if _RUN_TAG:
+        out.append(REPORT.with_name(f"real_model_{_RUN_TAG}.txt"))
+    out.append(REPORT)
+    return out
+
+
+def write_report(text: str) -> None:
+    for path in report_files():
+        path.write_text(text, encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -397,11 +417,25 @@ def main() -> int:
     ap.add_argument("--trigger-tokens", type=int, default=320)
     ap.add_argument("--keep-messages", type=int, default=4)
     ap.add_argument("--parts", default="AB")
-    ap.add_argument("--protect-budget", type=int, default=1200,
-                    help="cap on pinned tokens injected per model call")
+    ap.add_argument("--protect-budget", type=int, default=None,
+                    help="cap on pinned tokens injected per model call; omit to use "
+                         "the library default (2% of the trigger)")
     ap.add_argument("--policy", choices=["all", "flagged"], default="all",
                     help="how part B answers the gate: pin everything, or only flagged")
+    ap.add_argument("--patterns", choices=["oracle", "default"], default="default",
+                    help="oracle = protect_patterns built from the planted constraints' "
+                         "own keywords, i.e. the reviewer holds the answer key. That is "
+                         "what the first real-model run did, and it cannot say anything "
+                         "about triage. default = the shipped DEFAULT_PROTECT_PATTERNS.")
     args = ap.parse_args()
+
+    # One tag for one configuration, used for the archive directory, the graph
+    # thread and the report file. Without it two runs in one evening shared an
+    # archive, so the second inherited the first's keep.jsonl and both sets of
+    # stats were cumulative.
+    global _RUN_TAG
+    _RUN_TAG = f"{args.scenario}-{args.policy}-{args.patterns}" + (
+        "" if args.protect_budget is None else f"-b{args.protect_budget}")
 
     buf = io.StringIO()
 
@@ -415,16 +449,28 @@ def main() -> int:
 
     turns = hard_turns() if args.scenario == "hard" else easy_turns()
     say(f"scenario: {args.scenario}  ({len(turns)} user turns, {len(HARD)} planted constraints)")
+    say(f"run tag : {_RUN_TAG}")
     say(f"policy  : {args.policy}   trigger: ({'tokens'}, {args.trigger_tokens}) "
         f"keep: ({'messages'}, {args.keep_messages})")
-    say(f"budget  : {args.protect_budget} tokens injected per call = "
-        f"{args.protect_budget / args.trigger_tokens:.0%} of the trigger")
+    if args.protect_budget is None:
+        say("budget  : library default (2% of the trigger, clamped to [200, 4000])")
+    else:
+        say(f"budget  : {args.protect_budget} tokens injected per call = "
+            f"{args.protect_budget / args.trigger_tokens:.0%} of the trigger")
+    if args.patterns == "oracle":
+        say("triage  : **ORACLE** -- protect_patterns are the planted constraints' own "
+            "keywords.\n          This run can show that pinning survives compaction. It "
+            "cannot show that the\n          flag set finds the right lines; do not "
+            "quote it as if it could.")
+    else:
+        say("triage  : shipped DEFAULT_PROTECT_PATTERNS -- the reviewer gets no keyword "
+            "advantage\n          against the planted constraints.")
 
     api_model = args.model or detect_model(args.base_url)
     if api_model is None:
         say(f"!! no OpenAI-compatible server at {args.base_url}")
         say("   start one:  pwsh -NoProfile -File scripts\\start_local_server.ps1")
-        REPORT.write_text(buf.getvalue(), encoding="utf-8")
+        write_report(buf.getvalue())
         return 2
 
     say(f"endpoint: {args.base_url}   model: {api_model}")
@@ -432,7 +478,7 @@ def main() -> int:
     from langchain.agents import create_agent
     from langchain.agents.middleware import SummarizationMiddleware
     from langgraph.checkpoint.memory import InMemorySaver
-    from memory_gate import MemoryGateMiddleware
+    from memory_gate import DEFAULT_PROTECT_PATTERNS, MemoryGateMiddleware
 
     agent_model = build(args.base_url, api_model, max_tokens=80)
     summary_model = build(args.base_url, api_model, max_tokens=500)
@@ -454,7 +500,7 @@ def main() -> int:
         say("=" * 70)
         agent = create_agent(model=agent_model, tools=[], middleware=[make_summarizer()],
                              checkpointer=InMemorySaver())
-        config = {"configurable": {"thread_id": f"{args.scenario}-a"}}
+        config = {"configurable": {"thread_id": f"{_RUN_TAG}-a"}}
         n_compact, n_review = run_turns(agent, config, turns, say)
         say(f"  compaction cycles observed: {n_compact}   gate reviews: {n_review}")
         say(f"  summary markers in final state: {summarize_markers(agent, config)}")
@@ -478,19 +524,34 @@ def main() -> int:
         say("\n" + "=" * 70)
         say("PART B -- MemoryGateMiddleware in front of the same summarizer")
         say("=" * 70)
-        archive_dir = ROOT / ".scratch" / f"gate-{args.scenario}"
+        archive_dir = ROOT / ".scratch" / f"gate-{_RUN_TAG}"
         summarizer = make_summarizer()
+        planted_keys = tuple(c.must[0][0] for c in HARD)
+        if args.patterns == "oracle":
+            chosen = planted_keys + ("只用", "不用", "按这个来", "记一下")
+        else:
+            chosen = tuple(DEFAULT_PROTECT_PATTERNS)
+            # The whole point of --patterns default is that the reviewer does not
+            # know the answers. Report any accidental overlap instead of assuming
+            # there is none: `口径` ships in the default set and is also a word the
+            # revenue constraint uses, and a reader of this report is entitled to
+            # know that the comparison is not perfectly clean.
+            leak = [k for k in planted_keys
+                    if any(k.lower() in p.lower() or p.lower() in k.lower()
+                           for p in chosen)]
+            say(f"  oracle leak check: planted answer keywords also present in the "
+                f"default set -> {leak or 'none'}")
+        say(f"  patterns: {args.patterns} ({len(chosen)} entries)")
         gate = MemoryGateMiddleware(
             archive_dir=archive_dir,
             summarization=summarizer,
             review_threshold_tokens=1,
             protect_budget_tokens=args.protect_budget,
-            protect_patterns=tuple(c.must[0][0] for c in HARD)
-            + ("只用", "不用", "按这个来", "记一下"),
+            protect_patterns=chosen,
         )
         agent = create_agent(model=agent_model, tools=[], middleware=[gate, summarizer],
                              checkpointer=InMemorySaver())
-        config = {"configurable": {"thread_id": f"{args.scenario}-b"}}
+        config = {"configurable": {"thread_id": f"{_RUN_TAG}-b"}}
         policy = policy_flagged if args.policy == "flagged" else "keep all"
         n_compact, n_review = run_turns(agent, config, turns, say, resume_with=policy)
         say(f"  compaction cycles observed: {n_compact}   gate reviews: {n_review}")
@@ -531,8 +592,8 @@ def main() -> int:
         say(">>> The 'models drop constraints' premise is NOT supported by this run.")
         say(">>> Consider selling audit + recovery instead of loss-prevention.")
 
-    REPORT.write_text(buf.getvalue(), encoding="utf-8")
-    print(f"\nreport -> {REPORT}")
+    write_report(buf.getvalue())
+    print(f"\nreport -> {report_files()[0]}")
     return 0
 
 
@@ -542,9 +603,13 @@ if __name__ == "__main__":
     except MeasurementError as exc:
         message = f"MEASUREMENT ERROR: {exc}"
         print(f"\n\033[31m{message}\033[0m")
+        target = report_files()[0]
         try:
-            previous = REPORT.read_text(encoding="utf-8")
+            previous = target.read_text(encoding="utf-8")
         except OSError:
             previous = ""
-        REPORT.write_text(previous + "\n" + message + "\n", encoding="utf-8")
+        # An aborted run still has to leave a file behind, and that file has to
+        # say it aborted -- a partial transcript that reads like a finished one is
+        # how "8/10 survived" got written down once already.
+        write_report(previous + "\n" + message + "\n")
         raise SystemExit(3)
