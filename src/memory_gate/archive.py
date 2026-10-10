@@ -81,6 +81,15 @@ class Record:
     protected: bool = False
     """True once the user has pinned this record."""
 
+    pinned_via: str = "all"
+    """How this record came to be pinned, which decides eviction order under the
+    protect budget: ``"ref"`` (an explicit ``keep <n>``), ``"restore"`` (a manual
+    ``gate.restore``), ``"flagged"`` (blanket ``keep all``, pattern hit),
+    ``"all"`` (blanket, unflagged -- lost first).
+
+    Defaulted so a ``keep.jsonl`` written before this field existed still loads:
+    old lines simply read as ``"all"``, the conservative rank for an unknown."""
+
     def to_line(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
 
@@ -164,6 +173,31 @@ class Archive:
     def protected_ids(self) -> set[str]:
         return {r.id for r in self.protected()}
 
+    def legacy_pin_count(self) -> int:
+        """Lines in ``keep.jsonl`` that predate ``Record.pinned_via``.
+
+        They load as rank ``"all"`` -- tied with fresh blanket pins and losing
+        ties by age -- so an explicit pin made before an upgrade can be evicted
+        by a ``keep all`` answered after it. Counted from the raw lines so the
+        authoritative ``_read`` path stays untouched; a corrupt line is skipped
+        here because ``_read`` raises on it anyway and this is only a hint.
+        """
+        if not self.keep_path.exists():
+            return 0
+        count = 0
+        with self.keep_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict) and "pinned_via" not in data:
+                    count += 1
+        return count
+
     def get(self, message_id: str) -> Record | None:
         for rec in (*self.protected(), *self._read(self.archive_path)):
             if rec.id == message_id:
@@ -203,6 +237,44 @@ class Archive:
         ]
         self._append_lines(self.keep_path, [r.to_line() for r in fresh])
         return len(fresh)
+
+    def unprotect(self, ids: Iterable[str]) -> int:
+        """Unpin records by id. Returns how many were actually pinned.
+
+        The escape hatch for a mistake: `keep all` is the review's default
+        action, so pinning the wrong line is the expected path, not the
+        exceptional one -- and without a way out, the budget is spent on it
+        forever.
+
+        This is the one non-appending write in the module, so it is done as
+        rewrite-to-temp + fsync + atomic replace: a failed rewrite leaves the
+        original intact, because losing a *pin* silently would be the same
+        failure class as losing a message. The record itself also survives --
+        only `keep.jsonl` loses the line; `archive.jsonl` keeps the message.
+        """
+        targets = set(ids)
+        if not targets:
+            return 0
+        current = self.protected()
+        fresh = [r for r in current if r.id not in targets]
+        removed = len(current) - len(fresh)
+        if removed == 0:
+            return 0
+        self._ensure_root()
+        try:
+            tmp = self.keep_path.with_suffix(self.keep_path.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for line in (r.to_line() for r in fresh):
+                    fh.write(line + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.keep_path)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            raise ArchiveWriteError(
+                f"memory-gate could not rewrite {self.keep_path!s}: {exc}"
+            ) from exc
+        return removed
 
     # -------------------------------------------------------------- misc
 

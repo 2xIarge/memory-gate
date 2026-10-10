@@ -134,7 +134,14 @@ showed you.
 
 **3. Pin, then re-inject on every call.** Pinned text lands in `keep.jsonl` and is
 merged into the system message on each subsequent model call, so later rounds of
-compaction cannot take it back.
+compaction cannot take it back. When the pinned set outgrows the budget, what is
+dropped is decided by how each pin was earned: an explicit `keep <n>` or a manual
+`restore` is evicted last, pattern-flagged pins next, blanket `keep all` picks first.
+`keep all` is priced against the *whole* pinned set — this round's candidates plus what
+is already pinned and re-sent every call — so the reviewer sees the total before
+answering. The injected block then names the pins that were evicted (id, not text,
+capped), so the model can say it no longer holds them instead of guessing at content
+it cannot see.
 
 ## Measured
 
@@ -161,9 +168,13 @@ What the runs establish:
   (198 tokens) were re-sent; the two constraints it lost were pinned but never injected.
   72% of the pinned tokens were not constraints. `render_review_text` prints the
   overflow in tokens for exactly this reason.
-- **Blanket pinning and a proportional budget are not a matched pair.** Ranking pins --
-  explicit refs above flagged above blanket `keep all` -- would address both findings,
-  and is not implemented.
+- **Blanket pinning and a proportional budget are not a matched pair.** C2's two lost
+  constraints *are* this bullet. Ranking pins — explicit `keep <n>` above
+  pattern-flagged above blanket `keep all` — is implemented: `protected_view` fills the
+  budget in that order, so a line the reviewer named by number can no longer be evicted
+  by the chatter a `keep all` swept in with it. The budget mismatch itself (36% of
+  pinned tokens reached the model in C2) is unchanged; what changed is *which* pins
+  survive it.
 
 Caveats, in the order that changes the reading:
 
@@ -254,6 +265,7 @@ Every failure path is chosen so that a broken gate is visible, never quietly abs
 | Candidate set changed during resume | Raises. Refuses to compact a list you did not approve. |
 | Review set identical to one already answered | Skips the ask. Decision is already on disk. |
 | Compaction summary reaches the review list | Excluded by `lc_source=summarization`. You are never asked to preserve a paraphrase. |
+| Pins written before pin priorities (an upgrade) | Load as rank "all"; warns once and names the `unpin` + `restore` fix. An explicit pin from before the upgrade can be evicted by a later `keep all` otherwise. |
 
 The last table row matters more than it looks. Ask a human "do you want to keep this
 LLM-written summary?" and you have asked a question with no good answer.
@@ -277,9 +289,15 @@ LLM-written summary?" and you have asked a question with no good answer.
 
 ```python
 gate.search("April")        # substring search across everything ever archived
-gate.restore("ac5b5611-…")  # promote a forgotten message into the pinned set
+gate.restore("ac5b5611-…")  # promote a forgotten message into the pinned set (evicted last)
+gate.unpin("ac5b5611-…")    # take a mistaken pin back out; the message stays archived
 gate.archive.stats()        # {'archived': 16, 'protected': 1, ...}
 ```
+
+Mistakes are cheap in that direction: an unpinned line is never lost, only
+un-budgeted. `gate.unpin(id)` exists because `keep all` is the default action and
+therefore sweeps in chatter that then spends budget on every call until it is
+taken back out.
 
 Judging what matters *before* the loss is the hard part, and people get it wrong.
 Every gate run is recorded to `runs.jsonl`, so you can audit what was offered, what
@@ -304,7 +322,7 @@ python scripts/verify.py           # 47 staged assertions, offline
 python scripts/score_patterns.py   # what the `*` marks actually catch
 python scripts/render_at_scale.py  # the review block at a 200K window
 python examples/fiscal_year_demo.py
-python -m pytest                   # 50 tests
+python -m pytest                   # 61 tests
 ```
 
 ## License

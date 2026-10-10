@@ -173,6 +173,10 @@ def report(label, patterns, recorded):
 
 
 def main() -> int:
+    # The corpora are largely Chinese; on a cp936/gbk Windows console they
+    # mojibake, so force UTF-8 on stdout rather than trusting the locale.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     recorded = recorded_user_messages()
     print(f"compiled with IGNORECASE, as middleware.py does")
     print(f"recorded user messages: {len(recorded)}"

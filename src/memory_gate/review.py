@@ -99,6 +99,15 @@ class MemoryReviewRequest(TypedDict):
     missing several turns later.
     """
 
+    pinned_tokens: NotRequired[int]
+    """Tokens of the *already* pinned set, which is re-sent on every call.
+
+    A budget is spent by the whole pinned set, not by this round's candidates
+    alone, so ``keep all`` is priced against ``pinned_tokens + dropped_tokens``.
+    """
+
+    pinned_count: NotRequired[int]
+
 
 class MemoryReviewResponse(TypedDict):
     """What ``Command(resume=...)`` must carry."""
@@ -209,7 +218,10 @@ def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72,
     because a reviewer who does not read must still end up safe -- and it is the
     budget line above that keeps that promise honest: `keep all` pins everything,
     but only what fits the budget is re-sent, so the overflow is stated in tokens
-    rather than discovered as a missing rule twenty turns later.
+    rather than discovered as a missing rule twenty turns later. When the
+    already-pinned set is quoted against the budget, the reviewer can also see
+    that an explicit ``keep <n>`` outlives everything a blanket ``keep all``
+    would sweep in -- eviction order, not just the amount.
     """
     items = req["items"]
     shown = sorted(items, key=lambda i: (not i.get("flagged"), i["ref"]))[:max_items]
@@ -226,11 +238,23 @@ def render_review_text(req: MemoryReviewRequest, *, preview_width: int = 72,
     ]
 
     budget = req.get("budget_tokens")
-    if budget and req["dropped_tokens"] > budget:
+    pinned = req.get("pinned_tokens", 0)
+    pinned_count = req.get("pinned_count", 0)
+    if budget and req["dropped_tokens"] + pinned > budget:
+        over = req["dropped_tokens"] + pinned - budget
+        lines += [
+            f"keep all would bring the injected set to {req['dropped_tokens'] + pinned}"
+            f" tokens against a budget of {budget}: up to {over} tokens are not re-sent.",
+            "Eviction is by rank: explicit keep <n> and manual restores go last,",
+            "pattern-flagged pins before them, blanket keep all picks first;",
+            "oldest first within a rank.",
+            f"Already pinned and re-sent every call: {pinned} tokens across"
+            f" {pinned_count} statements.",
+        ]
+    elif budget and pinned:
         lines.append(
-            f"keep all would pin {req['dropped_tokens']} tokens but the budget is"
-            f" {budget}: the oldest {req['dropped_tokens'] - budget} tokens stay in the"
-            " archive and are not re-sent to the model."
+            f"Already pinned and re-sent every call: {pinned} tokens across"
+            f" {pinned_count} statements (budget {budget})."
         )
     if hidden > 0:
         lines.append(

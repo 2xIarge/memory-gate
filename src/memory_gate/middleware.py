@@ -37,6 +37,7 @@ import re
 import uuid
 import warnings
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from typing import Any
 
 from langchain_core.messages import (
@@ -72,6 +73,24 @@ from .review import (
 )
 
 __all__ = ["MemoryGateMiddleware", "DEFAULT_PROTECT_PATTERNS"]
+
+_PIN_RANK: dict[str, int] = {"ref": 0, "restore": 0, "flagged": 1, "all": 2}
+"""Eviction order for the protect budget; lower survives longer.
+
+The reviewer's deliberate choice outranks the pattern's guess, which outranks
+blanket ``keep all`` -- measured in the recorded run, blanket pinning spent the
+budget on 72% non-constraint text and the two constraints it lost were pinned but
+never injected. An unknown rank sits with ``"all"``: an unrecognised origin is
+least likely to be a decision the reviewer meant.
+"""
+
+_OMITTED_IDS_SHOWN = 5
+"""How many evicted pins to name in the injected block.
+
+These lines ride along on every model call but are *not* covered by the protect
+budget, so the list stays short: enough for the model to name what it no longer
+holds, not long enough to spend real budget on bookkeeping.
+"""
 
 try:  # prefer langchain's own estimator so our numbers match the gate we guard
     from langchain_core.messages.utils import count_tokens_approximately
@@ -352,6 +371,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             or (getattr(summarization, "token_counter", None) if summarization is not None else None)
             or _default_token_counter
         )
+        self._warned_legacy_pins = False
 
     # ------------------------------------------------------------ config
 
@@ -508,6 +528,30 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
 
     # ------------------------------------------------------ the gate itself
 
+    def _warn_legacy_pins_once(self, current_pins: int) -> None:
+        """Warn once if pins written before pin priorities load as rank "all".
+
+        An upgrade is the one path where a pin the reviewer made *explicitly*
+        silently drops to the weakest rank. The data is not lost -- it is still
+        on disk -- but the next `keep all` can evict it, so the upgrade has to
+        say so rather than let it surface as a missing rule twenty turns later.
+        """
+        if self._warned_legacy_pins or current_pins == 0:
+            return
+        legacy = self.archive.legacy_pin_count()
+        if not legacy:
+            return
+        self._warned_legacy_pins = True
+        warnings.warn(
+            f"memory-gate: {legacy} of {current_pins} pins in this archive were"
+            " written before pin priorities existed and now load as rank 'all'"
+            " (blanket). A newer `keep all` ties with them by rank and wins by"
+            " age, so an explicit pin from before the upgrade can be evicted."
+            " Nothing is lost: re-raise any of them with"
+            " gate.unpin(<id>) then gate.restore(<id>).",
+            stacklevel=2,
+        )
+
     def _run_gate(self, state: Any) -> dict[str, Any] | None:
         if not self.enabled:
             return None
@@ -601,6 +645,13 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             return outcome({"reviewed": False, "reason": "already_reviewed",
                             "review_id": review_id})
 
+        # What a `keep all` now would actually cost against the budget: what is
+        # already pinned re-sent on every call. Without this the reviewer answers
+        # blind and discovers the evicted end of the set several turns later.
+        already_pinned = self.archive.protected()
+        self._warn_legacy_pins_once(len(already_pinned))
+        pinned_tokens = sum(r.tokens for r in already_pinned)
+
         request: MemoryReviewRequest = {
             "review_id": review_id,
             "reason": "constraint_language" if risky else "token_threshold",
@@ -610,6 +661,8 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
             "omitted": len(zone) - len(candidates),
             "allowed": ["keep_selected", "keep_all", "confirm"],
             "budget_tokens": self.protect_budget_tokens,
+            "pinned_tokens": pinned_tokens,
+            "pinned_count": len(already_pinned),
         }
 
         payload = {"type": "memory_gate_review", **request, "text": render_review_text(request)}
@@ -636,8 +689,23 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         else:
             keep_refs = decision["keep_refs"]
 
-        chosen = [r for r, i in zip(candidates, items) if i["ref"] in set(keep_refs)]
-        pinned = self.archive.protect(chosen)
+        # Record how each pin was earned, so the budget can evict the weakest
+        # decision first. Under `keep selected` the reviewer named this line
+        # explicitly; under `keep all` the only signal left is the pattern flag.
+        keep_ref_set = set(keep_refs)
+        chosen = [
+            asdict(r)
+            | {
+                "pinned_via": (
+                    "ref"
+                    if mode == "keep_selected"
+                    else ("flagged" if i["flagged"] else "all")
+                )
+            }
+            for r, i in zip(candidates, items)
+            if i["ref"] in keep_ref_set
+        ]
+        pinned = self.archive.protect([Record(**fields) for fields in chosen])
 
         run = {
             "pass_no": pass_no,
@@ -656,7 +724,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
 
     # ------------------------------------------------------------- injection
 
-    def _injection_block(self, records: Sequence[Record]) -> str:
+    def _injection_block(self, records: Sequence[Record], omitted: Sequence[Record]) -> str:
         lines = [
             "<memory_gate>",
             "The following are VERBATIM user/assistant statements that the user",
@@ -666,28 +734,60 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         for r in records:
             body = r.text.strip().replace("\n", " ")
             lines.append(f"- [{r.role} #{r.id}] {body}")
+        if omitted:
+            # Ids, not text: the point is that the model can say "I no longer
+            # hold #ab12cd34" instead of guessing at content it cannot see, and
+            # that the id is greppable in archive.jsonl afterwards. Capped,
+            # because these lines are themselves re-sent on every call and are
+            # not covered by the protect budget. Oldest first: that is where a
+            # rule stated once at the start of a long session lives.
+            shown = omitted[:_OMITTED_IDS_SHOWN]
+            more = len(omitted) - len(shown)
+            ids = ", ".join(f"#{r.id[:8]}" for r in shown)
+            suffix = f" (+{more} more)" if more > 0 else ""
+            lines += [
+                f"Pinned but NOT in this context (budget full; lowest rank, oldest"
+                f" first, evicted): {ids}{suffix}.",
+                "They remain on disk in the archive. Say that you no longer hold"
+                " them rather than guessing at their content.",
+            ]
         lines.append("</memory_gate>")
         return "\n".join(lines)
 
     def protected_view(self) -> tuple[list[Record], list[Record]]:
         """Split the pinned set into (injected, omitted) under the budget.
 
-        Newest first: a constraint stated 300 turns ago is likelier stale than one
-        stated 3 turns ago. Nothing is deleted -- overflow stays pinned on disk and
-        the omission is declared inside the block, so the model can say "I no longer
-        have X in context" instead of quietly guessing at it.
+        Fills newest-first within each rank, but the ranks are not negotiable:
+        an explicit ``keep <n>`` or a manual ``restore`` outlives a pattern-flagged
+        pin, which outlives blanket ``keep all``. Under the old newest-first
+        ordering a single ``keep all`` could fill the budget with unflagged
+        chatter and evict a line the reviewer had named by number -- the recorded
+        C2 run lost two constraints exactly that way, both pinned, neither sent.
+
+        ``continue`` rather than ``break``: a big low-rank pin must not crowd out
+        a small high-rank one that still fits. Within a rank, newest first -- a
+        constraint stated 300 turns ago is likelier stale than one stated 3 turns
+        ago. Nothing is deleted: overflow stays pinned on disk and the omission is
+        declared inside the block, so the model can say "I no longer have X in
+        context" instead of quietly guessing at it.
         """
         records = self.archive.protected()
+        order = sorted(
+            enumerate(records),
+            key=lambda pair: (_PIN_RANK.get(pair[1].pinned_via, 2), -pair[0]),
+        )
         kept: list[Record] = []
         used = 0
-        for record in reversed(records):
+        for _, record in order:
             if used + record.tokens > self.protect_budget_tokens:
-                break
+                continue
             kept.append(record)
             used += record.tokens
-        kept.reverse()
-        included = {r.id for r in kept}
-        return kept, [r for r in records if r.id not in included]
+        kept_ids = {r.id for r in kept}
+        return (
+            [r for r in records if r.id in kept_ids],
+            [r for r in records if r.id not in kept_ids],
+        )
 
     def _apply_injection(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
         if not (self.enabled and self.inject):
@@ -701,15 +801,7 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         if not kept and not omitted:
             return request  # still verbatim in the window; no need to duplicate
 
-        block = self._injection_block(kept)
-        if omitted:
-            block = block.replace(
-                "</memory_gate>",
-                f" {len(omitted)} further pinned statements are NOT in this context "
-                "(the protect budget is full); they remain on disk and can be "
-                "retrieved. Say so rather than guessing at them."
-                + "\n</memory_gate>",
-            )
+        block = self._injection_block(kept, omitted)
         existing = getattr(request, "system_message", None)
         base = _text_of(existing) if existing is not None else ""
         merged = f"{base}\n\n{block}".strip() if base.strip() else block
@@ -748,6 +840,27 @@ class MemoryGateMiddleware(AgentMiddleware[StateT, ContextT, ResponseT]):
         rec = self.archive.get(message_id)
         if rec is None:
             raise GateError(f"memory-gate: no archived message with id {message_id!r}")
-        self.archive.protect([rec])
+        # Ranked as an explicit choice: the user went looking for this line by id,
+        # which is at least as deliberate as typing `keep 3`. If it is already
+        # pinned, protect() is a no-op and the original origin stands.
+        self.archive.protect([Record(**asdict(rec) | {"pinned_via": "restore"})])
         self.archive.mark_run({"reviewed": False, "reason": "manual_restore", "id": message_id})
         return rec
+
+    def unpin(self, message_id: str) -> Record | None:
+        """Unpin a pinned record and return it, or None if it was not pinned.
+
+        The counterpart to ``restore``: a blanket ``keep all`` sweeps in chatter
+        (72% of pinned tokens in the recorded run were not constraints), and
+        every unpinned line keeps consuming budget on every call until it is
+        taken back out. The message itself is never lost -- it stays in
+        ``archive.jsonl`` and can be re-pinned with ``restore`` at any time.
+        """
+        current = {r.id: r for r in self.archive.protected()}
+        gone = current.get(message_id)
+        if gone is None:
+            return None
+        self.archive.unprotect([message_id])
+        self.archive.mark_run({"reviewed": False, "reason": "manual_unpin",
+                               "id": message_id, "tokens": gone.tokens})
+        return gone

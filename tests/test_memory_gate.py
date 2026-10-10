@@ -9,6 +9,7 @@ working.
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 import warnings
@@ -126,6 +127,72 @@ def test_protect_and_restore_roundtrip(workdir: Path) -> None:
     assert gate.archive.protected_ids() == {"a"}
     with pytest.raises(GateError):
         gate.restore("missing")
+
+
+def test_unpin_keeps_the_message_and_allows_repin(workdir: Path) -> None:
+    """`keep all` is the review's default action, so a wrong pin is the expected
+    path. It must be reversible without touching the archive underneath."""
+    archive = Archive(workdir)
+    archive.append([Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=5,
+                           text=f"line {i}", kind="dialogue") for i in range(3)])
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4))
+    gate.archive.protect([Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=5,
+                                  text=f"line {i}", kind="dialogue", pinned_via="all")
+                          for i in range(3)])
+
+    gone = gate.unpin("m1")
+    assert gone is not None and gone.text == "line 1"
+    assert gate.archive.protected_ids() == {"m0", "m2"}
+    # the message itself is untouched: the archive is a superset on purpose
+    assert any(r.id == "m1" for r in gate.archive.search("line 1"))
+    # and it can come back
+    assert gate.restore("m1").text == "line 1"
+    assert gate.archive.protected_ids() == {"m0", "m1", "m2"}
+
+    # idempotent: unpinning something unpinned is a no-op, not an error
+    gate.unpin("m1")
+    assert gate.unpin("never-pinned") is None
+    assert gate.archive.protected_ids() == {"m0", "m2"}
+
+
+def test_unpin_rewrites_atomically(workdir: Path) -> None:
+    """The one non-appending write in the module. A temp file must never
+    survive, and the pins that were not removed must survive byte-identical."""
+    archive = Archive(workdir)
+    lines = [Record(id=f"m{i}", role="human", pass_no=i, ts="t", tokens=5,
+                    text=f"line {i}", kind="dialogue") for i in range(3)]
+    archive.append(lines)
+    archive.protect(lines)
+    before = [r.text for r in archive.protected()]
+
+    assert archive.unprotect(["m0"]) == 1
+    assert not list(workdir.glob("*.tmp")), "a temp file outlived the rewrite"
+    assert [r.text for r in archive.protected()] == before[1:]
+
+    assert archive.unprotect([]) == 0, "an empty unpin must not rewrite anything"
+    assert archive.unprotect(["not-pinned"]) == 0
+
+
+def test_unpin_removes_the_injection(workdir: Path) -> None:
+    """What the budget spends itself on is what reaches the model; unpinned
+    text must leave protected_view immediately, not on the next compaction."""
+    archive = Archive(workdir)
+    archive.append([Record(id="keep", role="human", pass_no=1, ts="t", tokens=30,
+                           text="a real rule", kind="dialogue")])
+    archive.append([Record(id="drop", role="human", pass_no=2, ts="t", tokens=30,
+                           text="inbox chatter", kind="dialogue")])
+    archive.protect([Record(id="keep", role="human", pass_no=1, ts="t", tokens=30,
+                            text="a real rule", kind="dialogue", pinned_via="all")])
+    archive.protect([Record(id="drop", role="human", pass_no=2, ts="t", tokens=30,
+                            text="inbox chatter", kind="dialogue", pinned_via="all")])
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4),
+                                protect_budget_tokens=100)
+
+    assert {r.id for r in gate.protected_view()[0]} == {"keep", "drop"}
+    gate.unpin("drop")
+    kept, omitted = gate.protected_view()
+    assert [r.id for r in kept] == ["keep"]
+    assert omitted == []
 
 
 # ------------------------------------------------------------ reply parsing
@@ -375,6 +442,181 @@ def test_absurd_budget_is_refused(workdir: Path) -> None:
     with pytest.raises(ValueError, match="protect_budget_tokens"):
         MemoryGateMiddleware(archive_dir=workdir, trigger=("tokens", 500),
                              protect_budget_tokens=10)
+
+
+# ------------------------------------------------- pin priorities under budget
+
+
+def _pin(archive: Archive, rec_id: str, tokens: int, pinned_via: str, pass_no: int) -> None:
+    archive.append([Record(id=rec_id, role="human", pass_no=pass_no, ts="t",
+                           tokens=tokens, text=f"text {rec_id}", kind="dialogue")])
+    archive.protect([Record(id=rec_id, role="human", pass_no=pass_no, ts="t",
+                            tokens=tokens, text=f"text {rec_id}", kind="dialogue",
+                            pinned_via=pinned_via)])
+
+
+def test_explicit_refs_are_evicted_last(workdir: Path) -> None:
+    """A line the reviewer named by number must outlive blanket pins.
+
+    Regression for the recorded C2 run: 58 blanket pins filled the budget and
+    both constraints it lost were pinned-but-never-injected. Newest-first
+    eviction made the reviewer's explicit pick no safer than the chatter
+    `keep all` swept in with it.
+    """
+    archive = Archive(workdir)
+    _pin(archive, "blanket-old", 300, "all", 1)
+    _pin(archive, "explicit-old", 200, "ref", 2)   # older and smaller
+    _pin(archive, "blanket-new", 300, "all", 3)    # newest of the three
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4),
+                                protect_budget_tokens=400)
+    kept, omitted = gate.protected_view()
+    assert [r.id for r in kept] == ["explicit-old"]
+    assert {r.id for r in omitted} == {"blanket-old", "blanket-new"}
+
+
+def test_flagged_pins_outrank_blanket(workdir: Path) -> None:
+    """A pattern hit is a weaker signal than an explicit pick but a stronger one
+    than unflagged blanket text -- the middle rank is where most of the value
+    of `keep all` actually lives."""
+    archive = Archive(workdir)
+    _pin(archive, "blanket", 150, "all", 1)
+    _pin(archive, "flagged", 250, "flagged", 2)
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4),
+                                protect_budget_tokens=300)
+    kept, omitted = gate.protected_view()
+    assert [r.id for r in kept] == ["flagged"], "an unflagged blanket pin won on size"
+    assert [r.id for r in omitted] == ["blanket"]
+
+
+def test_a_small_low_rank_pin_still_fills_the_leftover(workdir: Path) -> None:
+    """Eviction is per-item, not a cutoff: a big blanket pin must not starve a
+    small one that still fits after the explicit picks are placed."""
+    archive = Archive(workdir)
+    _pin(archive, "explicit", 100, "ref", 1)
+    _pin(archive, "blanket-big", 400, "all", 2)
+    _pin(archive, "blanket-small", 100, "all", 3)
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4),
+                                protect_budget_tokens=200)
+    kept, omitted = gate.protected_view()
+    assert {r.id for r in kept} == {"explicit", "blanket-small"}
+    assert [r.id for r in omitted] == ["blanket-big"]
+
+
+def test_keep_jsonl_without_pinned_via_still_loads(workdir: Path) -> None:
+    """A keep.jsonl written before the field existed reads as rank "all", so an
+    upgraded install loses nothing and simply evicts legacy pins first."""
+    (workdir / "keep.jsonl").write_text(
+        json.dumps({"id": "legacy", "role": "human", "pass_no": 1, "ts": "t",
+                    "tokens": 10, "text": "legacy rule", "kind": "dialogue",
+                    "protected": True},
+                   ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4))
+    kept, omitted = gate.protected_view()
+    assert [r.id for r in kept] == ["legacy"]
+    assert kept[0].pinned_via == "all"
+    assert omitted == []
+
+
+def test_legacy_pins_warn_once_and_name_the_fix(workdir: Path) -> None:
+    """The upgrade path is the one way a pin the reviewer made explicitly
+    silently drops to the weakest rank. It must be said out loud, once, with the
+    two-step fix -- and not every turn afterwards, or the warning gets ignored."""
+    legacy_line = json.dumps({"id": "old-pick", "role": "human", "pass_no": 1, "ts": "t",
+                              "tokens": 10, "text": "legacy rule", "kind": "dialogue",
+                              "protected": True}, ensure_ascii=False)
+    (workdir / "keep.jsonl").write_text(legacy_line + "\n", encoding="utf-8")
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gate._warn_legacy_pins_once(1)
+        gate._warn_legacy_pins_once(1)
+    msgs = [str(w.message) for w in caught if "before pin priorities" in str(w.message)]
+    assert len(msgs) == 1, "the warning must fire exactly once"
+    assert "rank 'all'" in msgs[0]
+    assert "unpin(<id>)" in msgs[0] and "restore(<id>)" in msgs[0]
+
+    # a current file must stay silent, or the warning is noise
+    fresh = MemoryGateMiddleware(archive_dir=workdir / "fresh", trigger=("messages", 4))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fresh._warn_legacy_pins_once(0)
+    assert not [w for w in caught if "before pin priorities" in str(w.message)]
+
+
+def test_pins_are_labelled_by_how_they_were_earned(workdir: Path) -> None:
+    """End to end: `keep <n>` labels the pin "ref" and a blanket reply does not.
+    If this labelling drifts, the budget falls back to evicting by age alone."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 3),
+                                keep_messages=1, review_threshold_tokens=0,
+                                protect_patterns=(r"fiscal year",))
+    agent = create_agent(model=fake_model("ok"), tools=[],
+                         middleware=[gate, make_summarizer()],
+                         checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "labels"}}
+    for message in history(2):
+        result = agent.invoke({"messages": [message]}, config=config)
+        while "__interrupt__" in result:
+            items = result["__interrupt__"][0].value["items"]
+            probe = next((i["ref"] for i in items if PROBE in i["preview"]), None)
+            result = agent.invoke(
+                Command(resume=f"keep {probe}" if probe is not None else "keep all"),
+                config=config)
+
+    pinned = gate.archive.protected()
+    assert pinned
+    assert all(r.pinned_via in ("ref", "flagged", "all") for r in pinned)
+    assert any(r.pinned_via == "ref" and PROBE in r.text for r in pinned)
+    assert any(r.pinned_via == "all" for r in pinned), "no blanket pin was ever recorded"
+
+
+def test_review_text_prices_keep_all_against_the_pinned_set(workdir: Path) -> None:
+    """The budget is spent by the whole pinned set, not by this round's
+    candidates. `keep all` must be priced against both, or the reviewer approves
+    it blind and the eviction shows up as a missing rule twenty turns later."""
+    from memory_gate.review import ReviewItem, build_review_id, render_review_text
+
+    items = [ReviewItem(ref=1, id="a", role="human", pass_no=1, tokens=100,
+                        flagged=False, preview="chatter from this round")]
+    request = {
+        "review_id": build_review_id(items),
+        "reason": "token_threshold",
+        "dropped_total": 3,
+        "dropped_tokens": 100,
+        "items": items,
+        "omitted": 2,
+        "allowed": ["keep_selected", "keep_all", "confirm"],
+        "budget_tokens": 300,
+        "pinned_tokens": 250,
+        "pinned_count": 2,
+    }
+    text = render_review_text(request)
+    assert "Already pinned and re-sent every call: 250 tokens across 2 statements" in text
+    assert "350" in text, "the would-be injected total must be stated"
+    assert "up to 50" in text
+    assert "explicit keep <n> and manual restores go last" in text, (
+        "the eviction order is the actionable part; it must not over-promise"
+        " that flagged pins always survive"
+    )
+
+
+def test_injection_block_names_the_evicted_pins(workdir: Path) -> None:
+    """An eviction the model cannot name is one it can only guess at. Ids, not
+    text, and capped: the block itself is re-sent every call outside the budget."""
+    gate = MemoryGateMiddleware(archive_dir=workdir, trigger=("messages", 4),
+                                protect_budget_tokens=100)
+    kept = [Record(id="kept-rule", role="human", pass_no=1, ts="t", tokens=50,
+                   text="a real rule", kind="dialogue")]
+    omitted = [Record(id=f"evicted{i:03d}", role="human", pass_no=i + 2, ts="t",
+                      tokens=30, text=f"chatter {i}", kind="dialogue")
+               for i in range(7)]
+    block = gate._injection_block(kept, omitted)
+    assert "a real rule" in block
+    assert block.count("#evicted") == 5, "the id list must stay capped"
+    assert "+2 more" in block
+    assert "lowest rank" in block, "the block states the eviction order inline"
+    assert "no longer hold" in block
 
 
 def test_constructing_without_a_trigger_is_refused(workdir: Path) -> None:
