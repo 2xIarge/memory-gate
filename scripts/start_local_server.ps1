@@ -1,16 +1,19 @@
 # Start a local OpenAI-compatible endpoint for memory-gate's real-model check.
 #
-#   pwsh -NoProfile -File scripts/start_local_server.ps1
-#   pwsh -NoProfile -File scripts/start_local_server.ps1 -ModelPath D:\models\... -GpuLayers 20
+#   pwsh -NoProfile -File scripts/start_local_server.ps1 -ModelPath <path\to\model.gguf> -ServerExe <path\to\llama-server>
+#   pwsh -NoProfile -File scripts/start_local_server.ps1 -ModelPath <...> -ServerExe <...> -GpuLayers 20
 #
 # Then in another shell:
 #   .\.venv\Scripts\python.exe scripts\verify_real_model.py
 #
-# Stop it with scripts\stop_local_server.ps1 (or Ctrl+C in the window it opens).
+# In the foreground, stop the server with Ctrl+C in the window it runs in.
 
 param(
-    [string]$ModelPath = 'D:\models\bartowski\Qwen_Qwen3.5-9B-GGUF\Qwen_Qwen3.5-9B-Q5_K_M.gguf',
-    [string]$ServerExe = 'D:\tools\llama.cpp\llama-server.exe',
+    # No baked-in defaults on purpose: point these at your own GGUF and
+    # llama-server build. The placeholders fail the Test-Path checks below with
+    # a clear message rather than silently assuming anyone's disk layout.
+    [string]$ModelPath = '<path\to\model.gguf>',
+    [string]$ServerExe = '<path\to\llama-server>',
     [int]$Context = 8192,
     [int]$GpuLayers = 99,
     [int]$Port = 8080,
